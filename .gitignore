@@ -1,0 +1,50 @@
+# Build outputs and local state
+/build/
+/third_party/devkitpro
+/third_party/devkitpro-root/
+/third_party/daedalus/build-ctr*/
+*.cia
+*.3dsx
+*.elf
+*.aot.cpp
+*.aot.json
+*.manifest.json
+*.build.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Never commit ROMs, firmware, keys or other proprietary data
+*.z64
+*.n64
+*.v64
+*.rom
+*.bin
+*.cia
+*.cci
+*.3ds
+*.app
+*.tmd
+*.cetk
+*.bnr
+!third_party/daedalus/Source/SysCTR/Resources/banner.bnr
+dspfirm.cdc
+*.key
+*.pem
+
+# Pinned upstream checkout; recreated by scripts/bootstrap.sh from the patch
+/third_party/daedalus/
+
+# Runtime logs copied from the console or Azahar
+daedalus.log
+n64to3ds-aot.log
+/tools/console-agent/build/
+
+.agents/
+.claude/
+.codex
+AGENTS.md
+N64to3DS_AGENT_TASK.md
+/out/release/

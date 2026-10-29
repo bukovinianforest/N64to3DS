@@ -1,0 +1,2 @@
+# Host-side test dependencies.  The build itself does not require pytest.
+pytest==7.4.4

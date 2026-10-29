@@ -1,0 +1,24 @@
+n64to3ds
+Copyright (C) 2026 n64to3ds contributors
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses/>.
+
+The runtime is a modified build of DaedalusX64:
+  https://github.com/DaedalusX64/daedalus
+  commit 580c0c409358db332149fc2903c610449434f8fc
+DaedalusX64 is licensed under the GNU General Public License version 2.  The
+minimal changes applied by this project are recorded in
+patches/daedalus-n64to3ds.patch.
+
+This project does not include any Nintendo ROM, BIOS, firmware, encryption key,
+or proprietary game asset.  Users must supply their own legally obtained ROMs.

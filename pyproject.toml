@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "n64to3ds"
+version = "0.1.0"
+description = "Package an N64 ROM into a standalone Old 3DS CIA with DaedalusX64 and optional AOT blocks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "ipl3checksum==1.3.1",
+  "rabbitizer==1.16.2",
+]
+license = { file = "LICENSE" }
+
+[project.scripts]
+n64to3ds = "tools.n64to3ds.cli:main"
+
+[tool.setuptools]
+packages = ["tools", "tools.n64to3ds"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
