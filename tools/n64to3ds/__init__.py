@@ -3,4 +3,4 @@
 The public entry point is :func:`tools.n64to3ds.cli.main`.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

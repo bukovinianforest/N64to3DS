@@ -36,7 +36,7 @@ Linux:
 
 Windows (Command Prompt or PowerShell):
 
-    cd C:\n64to3ds-0.1.0-windows-x86_64
+    cd C:\n64to3ds-0.2.0-windows-x86_64
     .\n64to3ds.cmd doctor
     .\n64to3ds.cmd build "D:\roms\Harvest Moon 64 (USA).z64" --output HM64.cia
 

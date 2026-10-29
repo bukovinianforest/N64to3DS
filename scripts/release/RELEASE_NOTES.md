@@ -20,13 +20,13 @@ keys or firmware.
 ### Harvest Moon 64 example
 
 ```bash
-tar -xJf n64to3ds-0.1.0-linux-x86_64.tar.xz
-cd n64to3ds-0.1.0-linux-x86_64
+tar -xJf n64to3ds-0.2.0-linux-x86_64.tar.xz
+cd n64to3ds-0.2.0-linux-x86_64
 ./n64to3ds build "/path/to/Harvest Moon 64 (USA).z64" --output HM64.cia
 ```
 
 ```bat
-cd C:\n64to3ds-0.1.0-windows-x86_64
+cd C:\n64to3ds-0.2.0-windows-x86_64
 .\n64to3ds.cmd build "D:\roms\Harvest Moon 64 (USA).z64" --output HM64.cia
 ```
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "n64to3ds"
-version = "0.1.0"
+version = "0.2.0"
 description = "Package an N64 ROM into a standalone Old 3DS CIA with DaedalusX64 and optional AOT blocks"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -271,6 +271,30 @@ The build is intentionally Old 3DS/2DS-safe:
 - The CIA is built with `EnableCompress: false` so the embedded ROM can be
   verified byte-for-byte.
 
+## Timing and audio on Old 3DS
+
+The runtime paces the guest's VI interrupt in real time: VIs come every TV
+frame (1/60 s NTSC) whatever the emulation speed, and the number of guest
+cycles per VI adapts to what the console can execute (20-100 % of the N64's).
+The guest therefore sees a slower CPU, drops frames of its own accord and keeps
+its audio and retrace-driven logic at full rate, as an N64 with a slower CPU
+would.  The audio ring trims that pace by up to 8 % so that the guest's
+per-retrace audio production settles on the DSP's consumption; samples keep
+their pitch.  Two more pieces make NuSys-style audio managers run every
+retrace: a graphics task rendering on core 1 is reported as *yielded* when the
+guest asks (libultra restarts it afterwards; nothing is drawn twice), and the
+AI FIFO model queues three buffers instead of the hardware's one, which is safe
+because an AI_LEN write copies the samples out at once.  Measured on an Old
+3DS in HM64's attract scenes: 746 to 10 ring underruns per minute, 54 to 59.5
+VI/s, 25.4 to 22.8 presents/s (the audio HLE now runs ~60 instead of ~45 times
+a second next to the display list on core 1).  A `n64to3ds diag:` line in
+`sdmc:/3ds/DaedalusX64/daedalus.log` every 900 end-of-frame callbacks records
+these counters; `scripts/triage_log.py` reads it.
+
+For unattended console runs, a file `sdmc:/3ds/n64to3ds-agent/autoreturn`
+holding a number of seconds makes the game quit after that long and return to
+the n64to3ds agent (`tools/console-agent`), which serves the logs.
+
 ## Reproducibility and licenses
 
 - Daedalus is pinned to commit

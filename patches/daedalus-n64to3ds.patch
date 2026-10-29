@@ -98,14 +98,15 @@ index 041208e..077cd92 100644
              -rsf ${APP_RSF}
              -banner ${APP_BANNER}
 diff --git a/Source/Core/CPU.cpp b/Source/Core/CPU.cpp
-index 10114da..af69bcd 100644
+index 10114da..2797aef 100644
 --- a/Source/Core/CPU.cpp
 +++ b/Source/Core/CPU.cpp
-@@ -23,6 +23,13 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+@@ -23,6 +23,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  #include "Base/Types.h"
  #include "Core/CPU.h"
  
 +#ifdef DAEDALUS_CTR
++#include <3ds.h>
 +// n64to3ds: defined in HLEAudio/Plugin/CTR/AudioPluginCTR.cpp.
 +u32 AudioPluginCTR_PollAsyncTask();
 +void AudioPluginCTR_FinishAsyncTask();
@@ -115,7 +116,108 @@ index 10114da..af69bcd 100644
  #include <algorithm>
  #include <string>
  #include <vector>
-@@ -142,6 +149,46 @@ void CPU_SkipToNextEvent()
+@@ -92,6 +100,100 @@ const  u32			kInitialVIInterruptCycles = 62500;
+ static u32			gVerticalInterrupts = 0;
+ static u32			VI_INTR_CYCLES(kInitialVIInterruptCycles);
+ 
++#ifdef DAEDALUS_CTR
++// n64to3ds: real-time VI pacing.
++//
++// Daedalus raises the guest's VI every (V_SYNC+1)*1500 COUNT cycles of guest
++// work, so when the emulated CPU is slow the VIs come late in real time and
++// everything the guest does per VI stretches with them, above all its
++// audio: NuSys makes one audio frame per retrace, at most 552 samples, so at
++// 54 VI/s HM64 made 10% too little audio (console, 746 ring underruns/min).
++// Here the VI period in cycles adapts so that VIs come every TV frame of
++// real time whatever the speed: the guest sees a slower CPU, drops frames of
++// its own accord and keeps its audio and retrace-driven logic at full rate,
++// as on an N64 with a slower CPU.  When the guest is ahead of real time the
++// period stays at the full 1500 cycles per line and FramerateLimiter sleeps.
++// The AI model drains one TV frame of audio per VI (CPU_GetAICountHz), so a
++// shorter VI does not make the guest produce less audio for it.
++//
++// The audio ring trims the pace.  The guest's audio manager makes at most 552
++// samples per retrace, 3.5% above the 533 a 60 Hz retrace needs, and loses
++// some frames to graphics tasks it cannot interrupt, so at exactly real time
++// it stays a few percent short and the ring sits at its floor (console: 59
++// VI/s, ring at ~200 of 8192 samples, 664 underruns/min).  Below the ring
++// setpoint the VIs come up to kVIRingTrimMax faster than real time, above
++// it slower: production settles on the DSP's consumption with margin in
++// the ring.  Only the guest's retrace rate moves, by a few percent; the
++// samples keep their pitch.
++const bool		CTR_REALTIME_VI = true;
++const float		kVIMaxCyclesPerLine = 1500.0f;	// full N64 speed
++// 20%.  Mario Kart 64 (console, in a race) stayed on a 40% floor at 40 VI/s:
++// its code runs at about half HM64's instructions per second in the dynarec,
++// so even 40% of the N64's cycles per VI took 24 ms.  The floor only binds
++// when the console cannot keep real time at all; the game's total CPU budget
++// is the host's speed either way, the floor just decides how many retraces
++// (and so audio frames) that budget is spread over.
++const float		kVIMinCyclesPerLine = 300.0f;
++const float		kVIRingSetpoint = 0.5f;			// of the ring
++const float		kVIRingGain = 0.3f;				// trim per unit of fill error: +8% at 27% below the setpoint
++const float		kVIRingTrimMax = 0.08f;
++static float	sVICyclesPerLine = kVIMaxCyclesPerLine;
++static float	sVITrim = 0.0f;
++static float	sVIWorkAvg = 0.0f;	// real ticks per VI, exponential average over ~8 VIs
++static u64		sVIWorkStart = 0;	// tick after the limiter at the previous VBL
++bool AudioOutputCTR_GetRingFill(float * fill);	// HLEAudio/Plugin/CTR/AudioOutput.cpp
++
++static u32 CPU_RealtimeVICyclesPerLine(u64 now)
++{
++	float fill = 0.0f;
++	sVITrim = 0.0f;
++	if (AudioOutputCTR_GetRingFill(&fill))
++	{
++		sVITrim = kVIRingGain * (kVIRingSetpoint - fill);
++		if (sVITrim > kVIRingTrimMax) sVITrim = kVIRingTrimMax;
++		if (sVITrim < -kVIRingTrimMax) sVITrim = -kVIRingTrimMax;
++	}
++	FramerateLimiter_SetSpeedTrim(sVITrim);
++	if (sVIWorkStart != 0 && now > sVIWorkStart)
++	{
++		const float target = float( double(SYSCLOCK_ARM11 / FramerateLimiter_GetTvFrequencyHz()) / (1.0 + sVITrim) );
++		const float work = float(now - sVIWorkStart);	// real time this VI took, limiter sleep excluded
++		// The guest idles through some VIs (waiting for a graphics task,
++		// skipped in no time) and works through others, so the average over
++		// several VIs is what must meet the target: steering on single VIs
++		// pushed the period up on every idle VI and left the busy ones late
++		// (console: 59 VI/s with the trim asking for 63).
++		sVIWorkAvg = sVIWorkAvg == 0.0f ? work : sVIWorkAvg + 0.125f * (work - sVIWorkAvg);
++		float wanted = sVICyclesPerLine * (target / sVIWorkAvg);
++		if (wanted > kVIMaxCyclesPerLine)
++			wanted = kVIMaxCyclesPerLine;
++		sVICyclesPerLine += 0.25f * (wanted - sVICyclesPerLine);
++		if (sVICyclesPerLine < kVIMinCyclesPerLine)
++			sVICyclesPerLine = kVIMinCyclesPerLine;
++		if (sVICyclesPerLine > kVIMaxCyclesPerLine)
++			sVICyclesPerLine = kVIMaxCyclesPerLine;
++	}
++	return u32(sVICyclesPerLine);
++}
++
++u32 CPU_GetVICyclesPerLine()
++{
++	return CTR_REALTIME_VI ? u32(sVICyclesPerLine) : 1500;
++}
++
++float CPU_GetVITrim()
++{
++	return sVITrim;
++}
++
++u64 CPU_GetAICountHz(u64 nominal)
++{
++	if (!CTR_REALTIME_VI || VI_INTR_CYCLES < 100000)	// off, or no video mode yet
++		return nominal;
++	return u64(VI_INTR_CYCLES) * FramerateLimiter_GetTvFrequencyHz();
++}
++#endif
++
+ #ifdef USE_SCRATCH_PAD
+ SCPUState *gPtrCPUState = (SCPUState*)0x10000;
+ #else
+@@ -142,6 +244,51 @@ void CPU_SkipToNextEvent()
  	gCPUState.Events[ 0 ].mCount = 1;
  }
  
@@ -150,6 +252,11 @@ index 10114da..af69bcd 100644
 +	while( CPU_RemoveEvent( CPU_EVENT_GRAPHICS_DP ) )
 +		GraphicsThreadCTR_RaiseFullSync();
 +}
++
++u32 CPU_GetVerticalInterruptCount()
++{
++	return gVerticalInterrupts;
++}
 +#endif
 +
 +static void CPU_CompleteAudioTask()
@@ -162,7 +269,7 @@ index 10114da..af69bcd 100644
  static void CPU_ResetEventList()
  {
  	gCPUState.Events[ 0 ].mCount     = kInitialVIInterruptCycles;
-@@ -474,6 +521,45 @@ static void HandleSaveStateOperationOnVerticalBlank()
+@@ -474,6 +621,52 @@ static void HandleSaveStateOperationOnVerticalBlank()
  		return;
  	std::scoped_lock lock(gSaveStateMutex);
  
@@ -196,11 +303,18 @@ index 10114da..af69bcd 100644
 +			R4300_Interrupt_UpdateCause3();
 +		}
 +	}
++	// The yield interrupt belongs to the guest that asked for it.  A loaded
++	// guest did not; its yielded task, if it has one, is rendered anew.
 +	while( CPU_RemoveEvent( CPU_EVENT_GRAPHICS_YIELD ) )
 +	{
-+		Memory_MI_SetRegisterBits(MI_INTR_REG, MI_INTR_SP);
-+		R4300_Interrupt_UpdateCause3();
++		if( gSaveStateOperation == SSO_SAVE )
++		{
++			Memory_MI_SetRegisterBits(MI_INTR_REG, MI_INTR_SP);
++			R4300_Interrupt_UpdateCause3();
++		}
 +	}
++	if( gSaveStateOperation == SSO_LOAD )
++		GraphicsThreadCTR_ResetYield();
 +	while( CPU_RemoveEvent( CPU_EVENT_GRAPHICS_DP ) )
 +		GraphicsThreadCTR_RaiseFullSync();
 +#endif
@@ -208,7 +322,28 @@ index 10114da..af69bcd 100644
  	//
  	// Handle the save state
  	//
-@@ -697,15 +783,43 @@ void CPU_HANDLE_COUNT_INTERRUPT()
+@@ -650,6 +843,10 @@ void CPU_HANDLE_COUNT_INTERRUPT()
+ 			else
+ 			{
+ 				VI_INTR_CYCLES = (vertical_sync_reg+1) * ( gVideoRateMatch ? gVISyncRate : 1500 );
++#ifdef DAEDALUS_CTR
++				if (CTR_REALTIME_VI)
++					VI_INTR_CYCLES = (vertical_sync_reg+1) * CPU_RealtimeVICyclesPerLine(svcGetSystemTick());
++#endif
+ 			}
+ 
+ 			// Apply cheatcodes, if enabled
+@@ -664,6 +861,9 @@ void CPU_HANDLE_COUNT_INTERRUPT()
+ 			gVerticalInterrupts++;
+ 
+ 			FramerateLimiter_Limit();
++#ifdef DAEDALUS_CTR
++			sVIWorkStart = svcGetSystemTick();	// n64to3ds: real-time VI pacing
++#endif
+ 
+ 			Memory_MI_SetRegisterBits(MI_INTR_REG, MI_INTR_VI);
+ 			R4300_Interrupt_UpdateCause3();
+@@ -697,15 +897,43 @@ void CPU_HANDLE_COUNT_INTERRUPT()
  		break;
  	case CPU_EVENT_AUDIO:
  		{
@@ -256,7 +391,7 @@ index 10114da..af69bcd 100644
  
  	#ifdef DAEDALUS_ENABLE_ASSERTS
 diff --git a/Source/Core/CPU.h b/Source/Core/CPU.h
-index 382a7ef..08fbcd6 100644
+index 382a7ef..03199b6 100644
 --- a/Source/Core/CPU.h
 +++ b/Source/Core/CPU.h
 @@ -73,10 +73,16 @@ enum	ECPUEventType
@@ -265,7 +400,7 @@ index 382a7ef..08fbcd6 100644
  	CPU_EVENT_SPINT,
 +	CPU_EVENT_GRAPHICS,		// n64to3ds: CTR graphics thread task check
 +	CPU_EVENT_GRAPHICS_DP,	// n64to3ds: CTR full sync held back for the audio
-+	CPU_EVENT_GRAPHICS_YIELD,	// n64to3ds: SP interrupt of a CTR graphics task released early
++	CPU_EVENT_GRAPHICS_YIELD,	// n64to3ds: SP interrupt of a CTR graphics task yielded to the guest
  };
  
  // In practice there should only ever be 2
@@ -277,14 +412,23 @@ index 382a7ef..08fbcd6 100644
  
  struct CPUEvent
  {
-@@ -177,6 +183,11 @@ void	CPU_EnableBreakPoint( u32 address, bool enable );		// Enable/Disable the br
+@@ -177,6 +183,20 @@ void	CPU_EnableBreakPoint( u32 address, bool enable );		// Enable/Disable the br
  bool	CPU_IsRunning();
  void	CPU_AddEvent( s32 count, ECPUEventType event_type );
  void	CPU_SkipToNextEvent();
 +#ifdef DAEDALUS_CTR
-+// n64to3ds: completes a graphics task still rendering on core 1 (its SP was
-+// released early) and raises a full sync held back for the audio.
++// n64to3ds: completes a graphics task still rendering on core 1 and raises a
++// full sync held back for the audio.
 +void	CPU_FinishGraphicsTask();
++// n64to3ds: VBLs since the CPU started, for the periodic log line.
++u32		CPU_GetVerticalInterruptCount();
++// n64to3ds: real-time VI pacing (see CPU.cpp).  The guest cycles per VI line
++// in use (1500 = full N64 speed), and the COUNT rate at which the AI model
++// drains so that one VI is one TV frame of audio; `nominal` when pacing is
++// off or no video mode is set yet.
++u32		CPU_GetVICyclesPerLine();
++float	CPU_GetVITrim();
++u64		CPU_GetAICountHz(u64 nominal);
 +#endif
  bool	CPU_CheckStuffToDo();
  using VblCallbackFn = void(*) (void * arg);
@@ -448,7 +592,7 @@ index 356942f..cf43d70 100644
  
  			stuff_to_do = gCPUState.GetStuffToDo();
 diff --git a/Source/Core/Memory.cpp b/Source/Core/Memory.cpp
-index 82d1c32..7bdc5b6 100644
+index 82d1c32..062aba2 100644
 --- a/Source/Core/Memory.cpp
 +++ b/Source/Core/Memory.cpp
 @@ -25,6 +25,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -497,17 +641,17 @@ index 82d1c32..7bdc5b6 100644
 +#ifdef DAEDALUS_CTR
 +	// n64to3ds: a yield request for a graphics task rendering on core 1.
 +	if ((flags & SP_SET_YIELD) && GraphicsThreadCTR_IsBusy())
-+		GraphicsThreadCTR_ReleaseSP();
++		GraphicsThreadCTR_YieldSP();
 +#endif
 +
  	//
  	// We execute the task here, after we've written to the SP status register.
  	//
 diff --git a/Source/Core/Memory_Read.inl b/Source/Core/Memory_Read.inl
-index 474d3df..b798deb 100644
+index 474d3df..85c1ab3 100644
 --- a/Source/Core/Memory_Read.inl
 +++ b/Source/Core/Memory_Read.inl
-@@ -140,13 +140,99 @@ static const void * Read_8440_844F( u32 address )
+@@ -140,13 +140,144 @@ static const void * Read_8440_844F( u32 address )
  	return temp;
  }
  
@@ -524,8 +668,29 @@ index 474d3df..b798deb 100644
 +namespace
 +{
 +	constexpr u64 kAICountHz = 46875000;
++	// n64to3ds: the hardware FIFO holds the playing buffer and one more.  The
++	// model queues up to kAIQueueDepth: an AI_LEN write copies the samples
++	// into the output ring at once (CAudioPluginCTR::LenChanged), so the guest
++	// may reuse its buffers early, and the deeper queue lets NuSys's audio
++	// manager, which makes no audio for a retrace that finds the FIFO FULL,
++	// catch up after its audio task waited for a graphics task on core 1
++	// (console: 80-165 skipped frames/min at the hardware depth and the
++	// output ring at its floor whatever the VI rate).
++	constexpr u32 kAIQueueDepth = 3;
 +	u32 gAICurrentBytes = 0;	// bytes left in the playing buffer
-+	u32 gAINextBytes = 0;		// queued buffer, 0 if the FIFO has one entry
++	u32 gAIQueue[kAIQueueDepth] = {};	// queued buffers, oldest first
++	u32 gAIQueued = 0;
++
++	u32 AI_PopQueue()
++	{
++		if (gAIQueued == 0)
++			return 0;
++		const u32 next = gAIQueue[0];
++		for (u32 i = 1; i < gAIQueued; ++i)
++			gAIQueue[i - 1] = gAIQueue[i];
++		--gAIQueued;
++		return next;
++	}
 +	u32 gAILastCount = 0;
 +	u64 gAIFraction = 0;		// sub-byte remainder, in byte * kAICountHz units
 +
@@ -543,9 +708,15 @@ index 474d3df..b798deb 100644
 +		const u32 dacrate = *(u32 *)((u8 *)g_pMemoryBuffers[MEM_AI_REG] + 0x10) & 0x3FFF;
 +		const u64 clock = g_ROM.TvType ? VI_NTSC_CLOCK : VI_PAL_CLOCK;
 +		const u64 bytes_per_second = (clock / (dacrate + 1)) * 4;	// 16-bit stereo
++#ifdef DAEDALUS_CTR
++		// n64to3ds: under real-time VI pacing one VI is one TV frame of audio.
++		const u64 count_hz = CPU_GetAICountHz(kAICountHz);
++#else
++		const u64 count_hz = kAICountHz;
++#endif
 +		gAIFraction += u64(elapsed) * bytes_per_second;
-+		u64 consumed = gAIFraction / kAICountHz;
-+		gAIFraction %= kAICountHz;
++		u64 consumed = gAIFraction / count_hz;
++		gAIFraction %= count_hz;
 +
 +		while (consumed != 0 && gAICurrentBytes != 0)
 +		{
@@ -557,8 +728,7 @@ index 474d3df..b798deb 100644
 +			else
 +			{
 +				consumed -= gAICurrentBytes;
-+				gAICurrentBytes = gAINextBytes;
-+				gAINextBytes = 0;
++				gAICurrentBytes = AI_PopQueue();
 +			}
 +		}
 +		if (gAICurrentBytes == 0)
@@ -566,10 +736,15 @@ index 474d3df..b798deb 100644
 +	}
 +}
 +
++// n64to3ds: AI_LEN writes and the samples they carried, for the periodic log
++// line (SysCTR/main.cpp).
++u32 gAILenWrites = 0;
++u32 gAILenSamples = 0;
++
 +void AI_ResetModel()
 +{
 +	gAICurrentBytes = 0;
-+	gAINextBytes = 0;
++	gAIQueued = 0;
 +	gAILastCount = gCPUState.CPUControl[C0_COUNT]._u32;
 +	gAIFraction = 0;
 +}
@@ -580,11 +755,20 @@ index 474d3df..b798deb 100644
 +	length &= 0x3FFF8;	// LS 3 bits ignored, 18-bit length
 +	if (length == 0)
 +		return;
++	++gAILenWrites;
++	gAILenSamples += length / 4;
 +	if (gAICurrentBytes == 0)
 +		gAICurrentBytes = length;
++	else if (gAIQueued < kAIQueueDepth)
++		gAIQueue[gAIQueued++] = length;
 +	else
-+		gAINextBytes = length;	// a write while FULL replaces the queued entry
++		gAIQueue[kAIQueueDepth - 1] = length;	// a write while FULL replaces the last entry
 +}
++
++// n64to3ds: AI_STATUS reads that showed the FIFO full, for the periodic log
++// line (SysCTR/main.cpp).  NuSys's audio manager reads the status once per
++// retrace and makes no audio for that frame when the FIFO is full.
++u32 gAIStatusFullReads = 0;
 +
  // 0x0450 0000 to 0x045F FFFF Audio Interface (AI) Registers
  static const void * Read_8450_845F( u32 address )
@@ -601,7 +785,12 @@ index 474d3df..b798deb 100644
 +		if (offset == 0x4)
 +			value = gAICurrentBytes;
 +		else
-+			value = (gAINextBytes != 0 ? 0x80000000u : 0u) | (gAICurrentBytes != 0 ? 0x40000000u : 0u);
++		{
++			const bool full = gAIQueued == kAIQueueDepth;
++			value = (full ? 0x80000000u : 0u) | (gAICurrentBytes != 0 ? 0x40000000u : 0u);
++			if (full)
++				++gAIStatusFullReads;
++		}
 +		return &value;
 +	}
 +	return (u8 *)g_pMemoryBuffers[MEM_AI_REG] + offset;
@@ -636,7 +825,7 @@ index 2189655..0d7ca16 100644
  		if (gAudioPlugin != NULL)
  		{
 diff --git a/Source/Core/RSP_HLE.cpp b/Source/Core/RSP_HLE.cpp
-index 8775d82..fb10b76 100644
+index 8775d82..6816d94 100644
 --- a/Source/Core/RSP_HLE.cpp
 +++ b/Source/Core/RSP_HLE.cpp
 @@ -35,6 +35,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -650,7 +839,7 @@ index 8775d82..fb10b76 100644
  #include "Utility/BatchTest.h"
  
  #include "Debug/PrintOpCode.h"
-@@ -135,6 +139,22 @@ static EProcessResult RSP_HLE_Graphics()
+@@ -135,6 +139,37 @@ static EProcessResult RSP_HLE_Graphics()
  {
  	DAEDALUS_PROFILE( "HLE: Graphics" );
  
@@ -659,6 +848,21 @@ index 8775d82..fb10b76 100644
 +	// is completed by CPU_EVENT_GRAPHICS once the thread is done.
 +	if (gGraphicsEnabled && gGraphicsPlugin != nullptr && GraphicsThreadCTR_IsAvailable())
 +	{
++		// A task restarted after a yield (OS_TASK_YIELDED: set by
++		// osSpTaskYielded, left in the DMEM copy by osSpTaskLoad) is the one
++		// core 1 is rendering or has just finished; nothing is drawn again.
++		// osSpTaskLoad also points its ucode_data at the yield data, so
++		// DLParser_BeginTask would misdetect the microcode.
++		const OSTask * task = (const OSTask *)(g_pu8SpMemBase + 0x0FC0);
++		if (task->t.flags & OS_TASK_YIELDED)
++		{
++			switch (GraphicsThreadCTR_ResumeYielded())
++			{
++			case GFX_RESUME_RENDERING:	return PR_STARTED;
++			case GFX_RESUME_DONE:		return PR_COMPLETED;
++			case GFX_RESUME_NONE:		break;	// no task yielded here: a new one
++			}
++		}
 +		// The previous task's end and full sync come first, as on the N64.
 +		CPU_FinishGraphicsTask();
 +		GraphicsThreadCTR_Wait();
@@ -1731,7 +1935,7 @@ index 0348c84..08011d5 100644
    // Only detect ABI once per game
    if (!bAudioChanged) {
 diff --git a/Source/HLEAudio/Plugin/CTR/AudioOutput.cpp b/Source/HLEAudio/Plugin/CTR/AudioOutput.cpp
-index 77fd295..ebb5e8d 100644
+index 77fd295..eecd4e2 100644
 --- a/Source/HLEAudio/Plugin/CTR/AudioOutput.cpp
 +++ b/Source/HLEAudio/Plugin/CTR/AudioOutput.cpp
 @@ -22,6 +22,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -1759,7 +1963,7 @@ index 77fd295..ebb5e8d 100644
  
  
  static ndspWaveBuf waveBuf[CTR_BUFFER_COUNT];
-@@ -52,30 +59,101 @@ static AudioOutput * ac;
+@@ -52,30 +59,125 @@ static AudioOutput * ac;
  
  CAudioBuffer *mAudioBuffer;
  
@@ -1781,11 +1985,17 @@ index 77fd295..ebb5e8d 100644
 +		s.R = s16((s32(s.R) * gain) / s32(n));
 +	}
 +}
- 
--	u32 samples_written = 0;
++
 +// Set when the last block played ended in a fade-out; the next audio then
 +// fades in, whether it follows a gap or the ring refilled just in time.
 +static bool sFadedOut = true;
+ 
+-	u32 samples_written = 0;
++// n64to3ds: diagnostics for the periodic log line (SysCTR/main.cpp).
++u32 gAudioUnderruns = 0;				// the ring ran dry while playing
++u32 gAudioSamplesIn = 0;				// guest samples handed to the ring (at the game's rate)
++u32 gAudioSamplesOut = 0;				// samples played from the ring (44.1 kHz)
++u32 gAudioRingMinSamples = 0xFFFFFFFF;	// least samples buffered at a refill while playing; the reader resets it
  
 -	if(waveBuf[waveBuf_id].status == NDSP_WBUF_DONE)
 +static void FillWaveBuf(ndspWaveBuf & buf)
@@ -1793,13 +2003,17 @@ index 77fd295..ebb5e8d 100644
 +	Sample * out = reinterpret_cast< Sample * >( buf.data_pcm16 );
 +	u32 written = 0;
 +
-+	if (sStarving && mAudioBuffer->GetNumBufferedSamples() >= CTR_RESUME_SAMPLES)
++	const u32 buffered = mAudioBuffer->GetNumBufferedSamples();
++	if (sStarving && buffered >= CTR_RESUME_SAMPLES)
 +		sStarving = false;
 +
 +	if (!sStarving)
  	{
 -		samples_written = mAudioBuffer->Drain( reinterpret_cast< Sample * >( waveBuf[waveBuf_id].data_pcm16 ), CTR_NUM_SAMPLES );
++		if (buffered < gAudioRingMinSamples)
++			gAudioRingMinSamples = buffered;
 +		written = mAudioBuffer->Drain( out, CTR_NUM_SAMPLES );
++		gAudioSamplesOut += written;
 +		if (sFadedOut && written != 0)
 +		{
 +			FadeSamples( out, written, true );
@@ -1813,22 +2027,25 @@ index 77fd295..ebb5e8d 100644
 +			sFadedOut = true;
 +		}
 +		if (written < CTR_NUM_SAMPLES)
++		{
 +			sStarving = true;
++			++gAudioUnderruns;
++		}
 +	}
-+
+ 
+-		if(samples_written != 0)
+-			waveBuf[waveBuf_id].nsamples = samples_written;
 +	// Never replay stale samples from the previous use of this buffer.
 +	if (written < CTR_NUM_SAMPLES)
 +		memset( out + written, 0, (CTR_NUM_SAMPLES - written) * sizeof( Sample ) );
  
--		if(samples_written != 0)
--			waveBuf[waveBuf_id].nsamples = samples_written;
+-		DSP_FlushDataCache(waveBuf[waveBuf_id].data_pcm16, CTR_NUM_SAMPLES << 2);
+-		ndspChnWaveBufAdd( 0, &waveBuf[waveBuf_id] );
 +	buf.nsamples = CTR_NUM_SAMPLES;
 +	DSP_FlushDataCache( buf.data_pcm16, CTR_NUM_SAMPLES * sizeof( Sample ) );
 +	ndspChnWaveBufAdd( 0, &buf );
 +}
- 
--		DSP_FlushDataCache(waveBuf[waveBuf_id].data_pcm16, CTR_NUM_SAMPLES << 2);
--		ndspChnWaveBufAdd( 0, &waveBuf[waveBuf_id] );
++
 +static void audioCallback(void *arg)
 +{
 +	(void)arg;
@@ -1855,6 +2072,17 @@ index 77fd295..ebb5e8d 100644
 +	return true;
 +}
 +
++// n64to3ds: the same as a fraction of the ring, for the real-time VI pacing
++// (Core/CPU.cpp).
++bool AudioOutputCTR_GetRingFill(float * fill)
++{
++	u32 samples = 0;
++	if (!AudioOutputCTR_GetBufferedSamples(&samples))
++		return false;
++	*fill = float(samples) / float(CTR_BUFFER_SIZE);
++	return true;
++}
++
  static void AudioInit()
  {
 -	if (ndspInit() != 0)
@@ -1871,7 +2099,7 @@ index 77fd295..ebb5e8d 100644
  
  	ndspSetOutputMode(NDSP_OUTPUT_STEREO);
  	ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
-@@ -88,11 +166,15 @@ static void AudioInit()
+@@ -88,11 +190,15 @@ static void AudioInit()
  		waveBuf[i].status = 0;
  
  		memset(waveBuf[i].data_pcm16, 0, CTR_NUM_SAMPLES * 4);
@@ -1887,7 +2115,7 @@ index 77fd295..ebb5e8d 100644
  
  	ndspSetCallback(&audioCallback, nullptr);
  
-@@ -102,6 +184,8 @@ static void AudioInit()
+@@ -102,6 +208,8 @@ static void AudioInit()
  
  static void AudioExit()
  {
@@ -1896,7 +2124,7 @@ index 77fd295..ebb5e8d 100644
  	// Stop stream
  	ndspChnWaveBufClear(0);
  	ndspExit();
-@@ -140,6 +224,11 @@ void AudioOutput::AddBuffer( u8 *start, u32 length )
+@@ -140,7 +248,13 @@ void AudioOutput::AddBuffer( u8 *start, u32 length )
  	if (!mAudioPlaying)
  		StartAudio();
  
@@ -1906,10 +2134,12 @@ index 77fd295..ebb5e8d 100644
 +
 +	sLastAddTick = svcGetSystemTick();
  	u32 num_samples = length / sizeof( Sample );
++	gAudioSamplesIn += num_samples;
  
  	u32 output_freq = DESIRED_OUTPUT_FREQUENCY;
+ 
 diff --git a/Source/HLEAudio/Plugin/CTR/AudioPluginCTR.cpp b/Source/HLEAudio/Plugin/CTR/AudioPluginCTR.cpp
-index 141871f..05b7b2a 100644
+index 141871f..f7ff6b6 100644
 --- a/Source/HLEAudio/Plugin/CTR/AudioPluginCTR.cpp
 +++ b/Source/HLEAudio/Plugin/CTR/AudioPluginCTR.cpp
 @@ -29,6 +29,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
@@ -1970,7 +2200,7 @@ index 141871f..05b7b2a 100644
  	}
  }
  
-@@ -74,26 +102,83 @@ CAudioPluginCTR::CAudioPluginCTR()
+@@ -74,13 +102,75 @@ CAudioPluginCTR::CAudioPluginCTR()
  :	mAudioOutput( new AudioOutput )
  {
  
@@ -1996,9 +2226,6 @@ index 141871f..05b7b2a 100644
 +	for (u32 limit : kCoreOneLimits)
  	{
 -		_runThread = true;
--
--		svcCreateEvent(&audioRequest, RESET_ONESHOT);
--		asyncThread = threadCreate(asyncProcess, 0, (8 * 1024), 0x18, 2, true);
 +		limit_result = APT_SetAppCpuTimeLimit(limit);
 +		if (R_SUCCEEDED(limit_result))
 +		{
@@ -2019,9 +2246,11 @@ index 141871f..05b7b2a 100644
 +		_runThread = false;
 +		svcCloseHandle(audioRequest);
 +		svcCloseHandle(audioDone);
- 	}
- }
++	}
++}
  
+-		svcCreateEvent(&audioRequest, RESET_ONESHOT);
+-		asyncThread = threadCreate(asyncProcess, 0, (8 * 1024), 0x18, 2, true);
 +// Called from the CPU_EVENT_AUDIO handler on the CPU thread.  Returns 0 when
 +// the guest may see the task as finished (SP status bits and the SP
 +// interrupt), or the number of COUNT cycles after which to check again.  The
@@ -2034,15 +2263,24 @@ index 141871f..05b7b2a 100644
 +
 +// Blocks until the audio thread has finished with the HLE audio state and
 +// RDRAM.
++// n64to3ds: CPU thread ticks spent waiting here, for the periodic log line
++// (SysCTR/main.cpp).
++u64 gAudioWaitTicks = 0;
++
 +void AudioPluginCTR_FinishAsyncTask()
 +{
-+	while (_audioBusy)
-+		svcWaitSynchronization(audioDone, 1000000);	// 1 ms; re-check the flag
++	if (_audioBusy)
++	{
++		const u64 wait_start = svcGetSystemTick();
++		while (_audioBusy)
++			svcWaitSynchronization(audioDone, 1000000);	// 1 ms; re-check the flag
++		gAudioWaitTicks += svcGetSystemTick() - wait_start;
+ 	}
 +	__sync_synchronize();
-+}
-+
+ }
+ 
  //*****************************************************************************
- //
+@@ -88,12 +178,16 @@ CAudioPluginCTR::CAudioPluginCTR()
  //*****************************************************************************
  CAudioPluginCTR::~CAudioPluginCTR()
  {
@@ -2060,7 +2298,7 @@ index 141871f..05b7b2a 100644
  	}
  
  	delete mAudioOutput;
-@@ -129,6 +214,8 @@ bool		CAudioPluginCTR::StartEmulation()
+@@ -129,6 +223,8 @@ bool		CAudioPluginCTR::StartEmulation()
  //*****************************************************************************
  void	CAudioPluginCTR::StopEmulation()
  {
@@ -2069,7 +2307,7 @@ index 141871f..05b7b2a 100644
  	Audio_Reset();
  	mAudioOutput->StopAudio();
  }
-@@ -153,6 +240,10 @@ void	CAudioPluginCTR::LenChanged()
+@@ -153,6 +249,10 @@ void	CAudioPluginCTR::LenChanged()
  	{
  		//mAudioOutput->SetAdaptFrequency( gAdaptFrequency );
  
@@ -2080,7 +2318,7 @@ index 141871f..05b7b2a 100644
  		u32		address( Memory_AI_GetRegister(AI_DRAM_ADDR_REG) & 0xFFFFFF );
  		u32		length(Memory_AI_GetRegister(AI_LEN_REG));
  
-@@ -187,10 +278,17 @@ EProcessResult	CAudioPluginCTR::ProcessAList()
+@@ -187,10 +287,17 @@ EProcessResult	CAudioPluginCTR::ProcessAList()
  			result = PR_COMPLETED;
  			break;
  		case APM_ENABLED_ASYNC:
@@ -2618,6 +2856,225 @@ index 642775f..c624259 100644
  #else
  static const EAudioPluginMode      kDefaultAudioPluginMode = APM_ENABLED_SYNC;
  static const ETextureHashFrequency kDefaultTextureHashFrequency = THF_EVERY_FRAME;
+diff --git a/Source/RomFile/ROMBuffer.cpp b/Source/RomFile/ROMBuffer.cpp
+index 5b31422..5ef3971 100644
+--- a/Source/RomFile/ROMBuffer.cpp
++++ b/Source/RomFile/ROMBuffer.cpp
+@@ -458,7 +458,8 @@ bool RomBuffer::CopyToRam( u8 * p_dst, u32 dst_offset, u32 dst_size, u32 src_off
+ 			u32		chunk_offset = 0;
+ 			u32		chunk_size = 0;
+ 
+-			if( !spRomFileCache->GetChunk( src_offset, &p_chunk_base, &chunk_offset, &chunk_size ) )
++			// The remaining length lets consecutive misses share one file read
++			if( !spRomFileCache->GetChunk( src_offset, &p_chunk_base, &chunk_offset, &chunk_size, length ) )
+ 			{
+ 				// Out of range
+ 				break;
+diff --git a/Source/RomFile/RomFileCache.cpp b/Source/RomFile/RomFileCache.cpp
+index 25c4ba0..0b61a43 100644
+--- a/Source/RomFile/RomFileCache.cpp
++++ b/Source/RomFile/RomFileCache.cpp
+@@ -26,6 +26,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ #include "RomFile/RomFileCache.h"
+ #include "RomFile/RomFileMemory.h"
+ 
++#include <algorithm>
++#include <cstring>
++#include <new>
++
+ 
+ #ifdef DAEDALUS_PSP
+ extern bool PSP_IS_SLIM;
+@@ -38,6 +42,9 @@ namespace
+ 	static  u32	STORAGE_BYTES;
+ 
+ 	static const u32	INVALID_ADDRESS = u32( ~0 );
++
++	// n64to3ds: upper bound of one LoadChunkRun read (32 chunks of 2 KB).
++	static const u32	MAX_RUN_BYTES = 64 * 1024;
+ }
+ 
+ struct SChunkInfo
+@@ -66,6 +73,7 @@ ROMFileCache::ROMFileCache()
+ ,	mChunkMapEntries( 0 )
+ ,	mpChunkMap( NULL )
+ ,	mMRUIdx( 0 )
++,	mpRunBuffer( nullptr )
+ {
+ #ifdef DAEDALUS_PSP
+ 	CHUNK_SIZE = 8 * 1024;
+@@ -90,6 +98,8 @@ ROMFileCache::ROMFileCache()
+ #endif
+ 	mpStorage   = (u8*)CROMFileMemory::Get()->Alloc( STORAGE_BYTES );
+ 	mpChunkInfo = new SChunkInfo[ CACHE_SIZE ];
++	// Optional: without it every miss uses the one-chunk path.
++	mpRunBuffer = new (std::nothrow) u8[ MAX_RUN_BYTES ];
+ }
+ 
+ //*****************************************************************************
+@@ -100,6 +110,7 @@ ROMFileCache::~ROMFileCache()
+ 	CROMFileMemory::Get()->Free( mpStorage );
+ 
+ 	delete [] mpChunkInfo;
++	delete [] mpRunBuffer;
+ }
+ 
+ //*****************************************************************************
+@@ -190,10 +201,84 @@ void	ROMFileCache::PurgeChunk( CacheIdx cache_idx )
+ 	chunk_info.LastUseIdx = 0;
+ }
+ 
++//*****************************************************************************
++// n64to3ds: on Old 3DS each romfs read costs ~15 ms almost independently of
++// its 2 KB size, and one PI DMA can miss dozens of consecutive chunks.  Load
++// up to max_chunks consecutive uncached chunks, starting at chunk_map_idx,
++// with one ReadChunk and install them in the same LRU order the one-chunk
++// path would.  Returns INVALID_IDX, having changed nothing, when fewer than
++// two chunks qualify or the read fails; the caller then takes that path.
++//*****************************************************************************
++ROMFileCache::CacheIdx	ROMFileCache::LoadChunkRun( u32 chunk_map_idx, u32 max_chunks )
++{
++	if( mpRunBuffer == nullptr )
++	{
++		return INVALID_IDX;
++	}
++
++	const u64	rom_size( mpROMFile->GetRomSize() );
++	const u32	limit( std::min( max_chunks, MAX_RUN_BYTES / CHUNK_SIZE ) );
++	u32			count( 0 );
++	while( count < limit )
++	{
++		const u32	map_idx( chunk_map_idx + count );
++		// Stop at a cached chunk, and leave a partial last chunk to the
++		// one-chunk path: its short read fails there and must stay so.
++		if( map_idx >= mChunkMapEntries || mpChunkMap[ map_idx ] != INVALID_IDX ||
++			u64( map_idx + 1 ) * CHUNK_SIZE > rom_size )
++		{
++			break;
++		}
++		++count;
++	}
++	if( count < 2 )
++	{
++		return INVALID_IDX;
++	}
++
++	if( !mpROMFile->ReadChunk( chunk_map_idx * CHUNK_SIZE, mpRunBuffer, count * CHUNK_SIZE ) )
++	{
++		return INVALID_IDX;
++	}
++
++	CacheIdx	first_idx( INVALID_IDX );
++	for( u32 i = 0; i < count; ++i )
++	{
++		// Same victim choice as GetCacheIndex.  Chunks installed earlier in
++		// this run are the most recent, so they are never chosen here.
++		CacheIdx	selected_idx( 0 );
++		u32			oldest_timestamp( mpChunkInfo[ 0 ].LastUseIdx );
++		for(CacheIdx j = 1; j < CACHE_SIZE; ++j)
++		{
++			u32		timestamp( mpChunkInfo[ j ].LastUseIdx );
++			if(timestamp < oldest_timestamp)
++			{
++				oldest_timestamp = timestamp;
++				selected_idx = j;
++			}
++		}
++
++		PurgeChunk( selected_idx );
++
++		SChunkInfo &		chunk_info( mpChunkInfo[ selected_idx ] );
++		chunk_info.StartOffset = ( chunk_map_idx + i ) * CHUNK_SIZE;
++		chunk_info.LastUseIdx = ++mMRUIdx;
++		mpChunkMap[ chunk_map_idx + i ] = selected_idx;
++
++		memcpy( mpStorage + selected_idx * CHUNK_SIZE, mpRunBuffer + i * CHUNK_SIZE, CHUNK_SIZE );
++
++		if( i == 0 )
++		{
++			first_idx = selected_idx;
++		}
++	}
++	return first_idx;
++}
++
+ //*****************************************************************************
+ //
+ //*****************************************************************************
+-ROMFileCache::CacheIdx	ROMFileCache::GetCacheIndex( u32 address )
++ROMFileCache::CacheIdx	ROMFileCache::GetCacheIndex( u32 address, u32 max_chunks )
+ {
+ 	u32		chunk_map_idx( AddressToChunkMapIndex( address ) );
+ 	#ifdef DAEDALUS_ENABLE_ASSERTS
+@@ -203,6 +288,14 @@ ROMFileCache::CacheIdx	ROMFileCache::GetCacheIndex( u32 address )
+ 	//	Check if this chunk is already cached, load if necessary
+ 	//
+ 	CacheIdx	idx( mpChunkMap[ chunk_map_idx ] );
++	if(idx == INVALID_IDX && max_chunks > 1)
++	{
++		idx = LoadChunkRun( chunk_map_idx, max_chunks );
++		if(idx != INVALID_IDX)
++		{
++			return idx;
++		}
++	}
+ 	if(idx == INVALID_IDX)
+ 	{
+ 		CacheIdx	selected_idx( 0 );
+@@ -251,13 +344,20 @@ ROMFileCache::CacheIdx	ROMFileCache::GetCacheIndex( u32 address )
+ //*****************************************************************************
+ //
+ //*****************************************************************************
+-bool	ROMFileCache::GetChunk( u32 rom_offset, u8 ** p_p_chunk_base, u32 * p_chunk_offset, u32 * p_chunk_size )
++bool	ROMFileCache::GetChunk( u32 rom_offset, u8 ** p_p_chunk_base, u32 * p_chunk_offset, u32 * p_chunk_size, u32 request_bytes )
+ {
+ 	u32		chunk_map_idx( AddressToChunkMapIndex( rom_offset ) );
+ 
+ 	if(chunk_map_idx < mChunkMapEntries)
+ 	{
+-		CacheIdx	idx( GetCacheIndex( rom_offset ) );
++		// Chunks spanned by [rom_offset, rom_offset + request_bytes)
++		u32		max_chunks( 1 );
++		if( request_bytes > 1 )
++		{
++			const u64	last( u64( rom_offset ) + request_bytes - 1 );
++			max_chunks = u32( std::min< u64 >( last / CHUNK_SIZE - chunk_map_idx + 1, MAX_RUN_BYTES / CHUNK_SIZE ) );
++		}
++		CacheIdx	idx( GetCacheIndex( rom_offset, max_chunks ) );
+ 		#ifdef DAEDALUS_ENABLE_ASSERTS
+ 		DAEDALUS_ASSERT( idx < CACHE_SIZE, "Invalid chunk index!" );
+ 		#endif
+diff --git a/Source/RomFile/RomFileCache.h b/Source/RomFile/RomFileCache.h
+index de3246b..0e5bc41 100644
+--- a/Source/RomFile/RomFileCache.h
++++ b/Source/RomFile/RomFileCache.h
+@@ -37,12 +37,15 @@ class ROMFileCache
+ 		bool				Open( std::shared_ptr<ROMFile> p_rom_file );
+ 		void				Close();
+ 
+-		bool				GetChunk( u32 rom_offset, u8 ** p_p_chunk_base, u32 * p_chunk_offset, u32 * p_chunk_size );
++		// request_bytes > 0 lets consecutive uncached chunks of that request
++		// be loaded with one file read; 0 keeps the one-chunk-per-read path.
++		bool				GetChunk( u32 rom_offset, u8 ** p_p_chunk_base, u32 * p_chunk_offset, u32 * p_chunk_size, u32 request_bytes = 0 );
+ 
+ 	private:
+ 		void				PurgeChunk( CacheIdx cache_idx );
+ 
+-		CacheIdx			GetCacheIndex( u32 address );
++		CacheIdx			GetCacheIndex( u32 address, u32 max_chunks = 1 );
++		CacheIdx			LoadChunkRun( u32 chunk_map_idx, u32 max_chunks );
+ 
+ 	private:
+ 		std::shared_ptr<ROMFile> 		mpROMFile;
+@@ -55,6 +58,8 @@ class ROMFileCache
+ 
+ 		u32					mMRUIdx;			// Most recently used index
+ 
++		u8 *				mpRunBuffer;		// Staging buffer for LoadChunkRun (may be null)
++
+ 		static const CacheIdx	INVALID_IDX = CacheIdx(-1);
+ };
+ 
 diff --git a/Source/RomFile/RomSettings.cpp b/Source/RomFile/RomSettings.cpp
 index d9d81c7..668ecc4 100644
 --- a/Source/RomFile/RomSettings.cpp
@@ -3145,7 +3602,7 @@ index 0000000..cfec8cc
 +
 +#endif // SYSCTR_GRAPHICS_GLSTATECACHECTR_H_
 diff --git a/Source/SysCTR/Graphics/GraphicsContextCTR.cpp b/Source/SysCTR/Graphics/GraphicsContextCTR.cpp
-index 8267130..c788165 100644
+index 8267130..23add7c 100644
 --- a/Source/SysCTR/Graphics/GraphicsContextCTR.cpp
 +++ b/Source/SysCTR/Graphics/GraphicsContextCTR.cpp
 @@ -3,6 +3,7 @@
@@ -3156,7 +3613,7 @@ index 8267130..c788165 100644
  
  #include "Interface/ConfigOptions.h"
  #include "Core/ROM.h"
-@@ -16,6 +17,10 @@
+@@ -16,8 +17,14 @@
  
  
  #include "SysCTR/UI/InGameMenu.h"
@@ -3166,8 +3623,12 @@ index 8267130..c788165 100644
 +#endif
  
  extern void HandleEndOfFrame();
++// n64to3ds: top-screen presents, for the periodic log line (SysCTR/main.cpp).
++u32 gCTRPresents = 0;
  
-@@ -160,6 +165,8 @@ void IGraphicsContext::ClearColBufferAndDepth(const c32 & colour)
+ #define SCR_WIDTH 400
+ #define SCR_HEIGHT 240
+@@ -160,6 +167,8 @@ void IGraphicsContext::ClearColBufferAndDepth(const c32 & colour)
  
  void IGraphicsContext::ResetVertexBuffer()
  {
@@ -3176,7 +3637,7 @@ index 8267130..c788165 100644
  	gVertexBuffer   = gVertexBufferPtr;
  	gColorBuffer    = gColorBufferPtr;
  	gTexCoordBuffer = gTexCoordBufferPtr;
-@@ -167,11 +174,49 @@ void IGraphicsContext::ResetVertexBuffer()
+@@ -167,11 +176,49 @@ void IGraphicsContext::ResetVertexBuffer()
  	gVertexCount      = 0;
  }
  
@@ -3227,7 +3688,7 @@ index 8267130..c788165 100644
  		ClearToBlack();
  		newFrame = false;
  	}
-@@ -187,12 +232,20 @@ void IGraphicsContext::BeginFrame()
+@@ -187,12 +234,21 @@ void IGraphicsContext::BeginFrame()
  
  void IGraphicsContext::EndFrame()
  {
@@ -3246,6 +3707,7 @@ index 8267130..c788165 100644
 -	pglSwapBuffers();
 +	GLCache_Flush();
 +	pglSwapBuffersEx(1, sBottomDrawnThisFrame ? 1 : 0);
++	++gCTRPresents;
 +	sBottomDrawnThisFrame = false;
  
  	newFrame = true;
@@ -3346,10 +3808,10 @@ index 2177e7b..219f04a 100644
  	DestroyRenderer();
 diff --git a/Source/SysCTR/HLEGraphics/GraphicsThreadCTR.cpp b/Source/SysCTR/HLEGraphics/GraphicsThreadCTR.cpp
 new file mode 100644
-index 0000000..ff0a0a7
+index 0000000..49adfd7
 --- /dev/null
 +++ b/Source/SysCTR/HLEGraphics/GraphicsThreadCTR.cpp
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,527 @@
 +// n64to3ds: HLE display-list rendering on core 1; see GraphicsThreadCTR.h.
 +
 +#include "Base/Types.h"
@@ -3426,9 +3888,11 @@ index 0000000..ff0a0a7
 +u32				sDpDelayCycles = 0;
 +// A full-sync interrupt waits for CPU_EVENT_GRAPHICS_DP.
 +bool			sDpPending = false;
-+// The guest was told the SP task finished before core 1 did (see
-+// GraphicsThreadCTR_ReleaseSP).
-+bool			sSpReleased = false;
++// The guest was told the task yielded (GraphicsThreadCTR_YieldSP); the SP
++// task end is held until the guest restarts the task.
++bool			sYieldAcked = false;
++// Core 1 finished while the task was yielded; the restart reports it done.
++bool			sYieldDone = false;
 +// Written by the graphics thread while it renders, read by the CPU thread
 +// after it has seen sBusy == false.
 +volatile bool	sFullSyncPending = false;
@@ -3562,6 +4026,12 @@ index 0000000..ff0a0a7
 +}
 +}
 +
++// n64to3ds: diagnostics for the periodic log line (SysCTR/main.cpp).
++u64 gGfxWaitTicks = 0;			// CPU thread blocked in GraphicsThreadCTR_Wait
++u32 gGfxYieldAcks = 0;			// yields acknowledged to the guest
++u32 gGfxYieldResumes = 0;		// yielded tasks restarted by the guest
++u32 gGfxYieldResumedDone = 0;	// of which core 1 had already finished
++
 +bool GraphicsThreadCTR_IsAvailable()
 +{
 +	if (!sTriedCreate)
@@ -3600,7 +4070,9 @@ index 0000000..ff0a0a7
 +void GraphicsThreadCTR_StartTask()
 +{
 +	sTaskInFlight = true;
-+	sSpReleased = false;
++	// A yield the guest never restarted (reset) ends with its task.
++	sYieldAcked = false;
++	sYieldDone = false;
 +	sFullSyncPending = false;
 +	sEndOfFramePending = false;
 +	sDeferredCycles = GRAPHICS_FIRST_POLL_CYCLES;
@@ -3677,41 +4149,83 @@ index 0000000..ff0a0a7
 +	// A VI origin change while the task rendered was not presented (see
 +	// Memory_WriteValue.inl); UpdateScreen() presents it if there was one.
 +	gGraphicsPlugin->UpdateScreen();
-+	// After an early release the SP may be running another task by now.
-+	if (!sSpReleased)
++	// For the guest a yielded task ends only once it restarts the task
++	// (GraphicsThreadCTR_ResumeYielded): a yielded RSP stays halted until
++	// osSpTaskStartGo.
++	if (sYieldAcked)
++		sYieldDone = true;
++	else
 +		RSP_HLE_Finished(SP_STATUS_TASKDONE|SP_STATUS_BROKE|SP_STATUS_HALT);
-+	sSpReleased = false;
 +}
 +
 +// An audio task must not wait for core 1.  NuSys asks a running graphics
-+// task to yield (SP_SET_YIELD) when audio is due and waits for the SP; HLE
-+// cannot yield, so the audio task waited until core 1 had rendered the whole
-+// display list, up to three VIs of guest time with the guest idling quickly
-+// meanwhile.  The AI FIFO ran dry and the audio manager, catching up, found
-+// it FULL and dropped frames (console AISKIP run: ~1 VI per graphics task,
-+// 8-15% of audio frames dropped).  Report the task as finished instead of
-+// yielded, so libultra treats it as done and runs audio at once.  The
-+// full-sync interrupt, which NuSys waits for before it starts the next
-+// graphics task, still comes when core 1 is done: the RSP finishing before
-+// the RDP, as on the N64.
++// task to yield (SP_SET_YIELD) when audio is due and waits for the SP.  With
++// no yield the audio task waited until core 1 had rendered the whole display
++// list, up to three VIs of guest time with the guest idling quickly
++// meanwhile; the AI FIFO ran dry and the audio manager, catching up, found
++// it FULL and made no audio for those frames (console AISKIP run: ~1 VI per
++// graphics task, 8-15% of audio frames dropped).
++//
++// The task is reported yielded, as the RSP would report it: SP_STATUS_YIELD
++// and SP_STATUS_YIELDED with HALT and BROKE, then the SP interrupt.
++// libultra's osSpTaskYielded marks the task OS_TASK_YIELDED, NuSys runs the
++// audio task and restarts the graphics task with that flag (osSpTaskLoad
++// leaves it in the DMEM copy); GraphicsThreadCTR_ResumeYielded then
++// continues the task core 1 never stopped rendering, and the SP task end
++// comes when core 1 is done, as before.  NuSys's graphics dispatcher keeps
++// waiting for that end, so the game does not build its next frame early.
++// (Reporting the task *done* at the yield let it: on the console presents
++// rose from 16 to 21/s in HM64's music scenes, but the game slowed from 52
++// to 45 VI/s with twice the underruns.)
 +//
 +// The SP interrupt follows SP_YIELD_CYCLES later (CPU_EVENT_GRAPHICS_YIELD),
 +// as a yield takes RSP time: NuSys's audio thread, which asked for it, is
 +// waiting for it by then, ahead of its graphics thread on the same queue.
 +const u32 SP_YIELD_CYCLES = 20000;
-+// Off: on the console the release alone raised presents from 16 to 21/s in
-+// HM64's music scenes but slowed the game from 52 to 45 VI/s with twice the
-+// underruns; the owner is comparing both.
-+const bool GRAPHICS_RELEASE_SP_ON_YIELD = false;
++// Measured on an Old 3DS (HM64 attract scenes, ~285 s each, builds otherwise
++// equal).  Without the yield NuSys's audio manager ran only when the SP was
++// free between display lists: 45 audio frames/s at 64 VI/s, 22.7k of the
++// 32k samples/s the DSP plays, the output ring at its floor and 640-750
++// underruns/min.  With the yield alone the extra audio frames stretched the
++// guest's VIs (54 -> 48 VI/s) and made things worse (993 underruns/min); with
++// the real-time VI pacing in Core/CPU.cpp (VIs at 60 Hz whatever the speed)
++// and the deeper AI FIFO model (Core/Memory_Read.inl) the manager makes one
++// frame per VI: 59.5 frames/s, 31.8k samples/s, 746 -> 10 underruns/min.
++// The cost is the audio HLE itself, now ~60 instead of ~45 frames a second
++// on core 1 next to the display list: 25.4 -> 22.8 presents/s.
++const bool GRAPHICS_YIELD_EMULATION = true;
 +
-+void GraphicsThreadCTR_ReleaseSP()
++void GraphicsThreadCTR_YieldSP()
 +{
-+	if (!GRAPHICS_RELEASE_SP_ON_YIELD || !sTaskInFlight || sSpReleased)
++	if (!GRAPHICS_YIELD_EMULATION || !sTaskInFlight || sYieldAcked)
 +		return;
-+	sSpReleased = true;
-+	const u32 status = Memory_SP_SetRegisterBits(SP_STATUS_REG, SP_STATUS_TASKDONE|SP_STATUS_BROKE|SP_STATUS_HALT);
++	sYieldAcked = true;
++	sYieldDone = false;
++	++gGfxYieldAcks;
++	const u32 status = Memory_SP_SetRegisterBits(SP_STATUS_REG, SP_STATUS_YIELD|SP_STATUS_YIELDED|SP_STATUS_BROKE|SP_STATUS_HALT);
 +	if (status & SP_STATUS_INTR_BREAK)
 +		CPU_AddEvent(SP_YIELD_CYCLES, CPU_EVENT_GRAPHICS_YIELD);
++}
++
++EGfxResume GraphicsThreadCTR_ResumeYielded()
++{
++	if (!sYieldAcked)
++		return GFX_RESUME_NONE;
++	++gGfxYieldResumes;
++	sYieldAcked = false;
++	if (sYieldDone)
++	{
++		sYieldDone = false;
++		++gGfxYieldResumedDone;
++		return GFX_RESUME_DONE;
++	}
++	return GFX_RESUME_RENDERING;
++}
++
++void GraphicsThreadCTR_ResetYield()
++{
++	sYieldAcked = false;
++	sYieldDone = false;
 +}
 +
 +void GraphicsThreadCTR_RaiseFullSync()
@@ -3727,8 +4241,13 @@ index 0000000..ff0a0a7
 +{
 +	if (sThread == nullptr || GraphicsThreadCTR_IsCurrentThread())
 +		return;
-+	while (sBusy)
-+		svcWaitSynchronization(sDone, 1000000);	// 1 ms; re-check the flag
++	if (sBusy)
++	{
++		const u64 wait_start = svcGetSystemTick();
++		while (sBusy)
++			svcWaitSynchronization(sDone, 1000000);	// 1 ms; re-check the flag
++		gGfxWaitTicks += svcGetSystemTick() - wait_start;
++	}
 +	__sync_synchronize();
 +}
 +
@@ -3737,6 +4256,7 @@ index 0000000..ff0a0a7
 +	if (sThread == nullptr)
 +		return;
 +	GraphicsThreadCTR_Wait();
++	GraphicsThreadCTR_ResetYield();
 +	sRun = false;
 +	svcSignalEvent(sRequest);
 +	threadJoin(sThread, U64_MAX);
@@ -3821,10 +4341,10 @@ index 0000000..ff0a0a7
 +}
 diff --git a/Source/SysCTR/HLEGraphics/GraphicsThreadCTR.h b/Source/SysCTR/HLEGraphics/GraphicsThreadCTR.h
 new file mode 100644
-index 0000000..0a82069
+index 0000000..2322b3f
 --- /dev/null
 +++ b/Source/SysCTR/HLEGraphics/GraphicsThreadCTR.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,70 @@
 +#pragma once
 +
 +#include "Base/Types.h"
@@ -3852,10 +4372,18 @@ index 0000000..0a82069
 +u32  GraphicsThreadCTR_Poll();
 +// Completes a finished task on the CPU thread (see above).
 +void GraphicsThreadCTR_CompleteTask();
-+// The guest asked the running graphics task to yield (SP_SET_YIELD): the SP
-+// task is reported finished now, the rest of the completion stays with
-+// GraphicsThreadCTR_CompleteTask.
-+void GraphicsThreadCTR_ReleaseSP();
++// The guest asked the task rendering on core 1 to yield (SP_SET_YIELD).  The
++// guest is told the task yielded; core 1 keeps rendering, and the SP task end
++// is held until the guest restarts the task.
++void GraphicsThreadCTR_YieldSP();
++// The guest restarted a yielded task (OS_TASK_YIELDED in the DMEM task).
++// RENDERING: core 1 is still on it, the caller returns PR_STARTED.  DONE: it
++// finished meanwhile, the caller reports the task done now.  NONE: no task
++// yielded here (e.g. after a savestate load), render it as a new task.
++enum EGfxResume { GFX_RESUME_NONE, GFX_RESUME_RENDERING, GFX_RESUME_DONE };
++EGfxResume GraphicsThreadCTR_ResumeYielded();
++// Forgets a yield the guest will never restart (savestate load).
++void GraphicsThreadCTR_ResetYield();
 +// Raises a full-sync interrupt held back to pace the guest's frames for its
 +// audio (see GraphicsThreadCTR.cpp), on CPU_EVENT_GRAPHICS_DP.  The caller
 +// removes the event; before another task starts and before a savestate.
@@ -4040,7 +4568,7 @@ index b56121e..5d7124e 100644
  
  #ifdef __cplusplus
 diff --git a/Source/SysCTR/main.cpp b/Source/SysCTR/main.cpp
-index 73645eb..4d5b47f 100644
+index 73645eb..3ea83e0 100644
 --- a/Source/SysCTR/main.cpp
 +++ b/Source/SysCTR/main.cpp
 @@ -3,6 +3,8 @@
@@ -4106,7 +4634,7 @@ index 73645eb..4d5b47f 100644
  	
  	pglInitEx(0x080000, 0x040000);
  
-@@ -119,6 +144,22 @@ static void Initialize()
+@@ -119,14 +144,168 @@ static void Initialize()
  }
  
  
@@ -4126,10 +4654,104 @@ index 73645eb..4d5b47f 100644
 +
 +extern float gCurrentFramerate;
 +
++// n64to3ds: unattended hardware runs.  If sdmc:/3ds/n64to3ds-agent/autoreturn
++// holds a number of seconds, the game quits after that long and the console
++// returns to the n64to3ds agent (tools/console-agent), which then serves the
++// logs.  The file is removed when read, so one file means one timed run.
++static const char * kAutoReturnFile = "sdmc:/3ds/n64to3ds-agent/autoreturn";
++static const u64 kAgentTitleId = 0x000400000A6E7000ULL;
++static u64 sAutoReturnDeadline = 0;	// system ticks, 0 = off
++
++static void SetupAutoReturn()
++{
++	long seconds = 0;
++	{
++		std::ifstream in(kAutoReturnFile);
++		if (!(in >> seconds))
++			return;
++	}
++	std::remove(kAutoReturnFile);
++	if (seconds <= 0 || seconds > 24 * 3600)
++		return;
++	sAutoReturnDeadline = svcGetSystemTick() + u64(seconds) * u64(SYSCLOCK_ARM11);
++	std::cout << "n64to3ds autoreturn: quitting to the agent after " << seconds << " s" << std::endl;
++}
++
++// n64to3ds: counters kept by the CTR audio and graphics paths, logged once
++// per window in HandleEndOfFrame.  The key names match scripts/triage_log.py.
++// A window is 900 end-of-frame callbacks (graphics tasks that ended a frame;
++// HM64 issues about three per displayed frame), so presents_per_s is the
++// number to compare with the on-screen FPS.
++extern u32 gCTRPresents;									// SysCTR/Graphics/GraphicsContextCTR.cpp
++extern u32 gAudioUnderruns, gAudioRingMinSamples;			// HLEAudio/Plugin/CTR/AudioOutput.cpp
++extern u32 gAudioSamplesIn, gAudioSamplesOut;
++extern u32 gAILenWrites, gAILenSamples;						// Core/Memory_Read.inl
++extern u32 gAudioRingFullWaits, gAudioRingDroppedSamples;	// HLEAudio/AudioBuffer.cpp
++extern u64 gAudioWaitTicks;									// HLEAudio/Plugin/CTR/AudioPluginCTR.cpp
++extern u32 gAIStatusFullReads;								// Core/Memory_Read.inl
++extern u64 gGfxWaitTicks;									// SysCTR/HLEGraphics/GraphicsThreadCTR.cpp
++extern u32 gGfxYieldAcks, gGfxYieldResumes, gGfxYieldResumedDone;
++
++static void LogDiagWindow(u64 elapsed_ticks, u32 frames)
++{
++	static u32 last_vi = 0, last_presents = 0, last_underruns = 0, last_full_waits = 0, last_dropped = 0, last_ai_full = 0;
++	static u32 last_in = 0, last_out = 0, last_len_writes = 0;
++	static u32 last_yield_acks = 0, last_yield_resumes = 0, last_yield_done = 0;
++	static u64 last_audio_wait = 0, last_gfx_wait = 0;
++	const double tick_hz = static_cast<double>(SYSCLOCK_ARM11);
++	const double seconds = static_cast<double>(elapsed_ticks) / tick_hz;
++	const double per_second = seconds > 0.0 ? 1.0 / seconds : 0.0;
++	const u32 vi = CPU_GetVerticalInterruptCount();
++	const u32 ring_min = gAudioRingMinSamples;	// -1: nothing played in the window
++	gAudioRingMinSamples = 0xFFFFFFFF;
++	char line[384];
++	snprintf(line, sizeof(line),
++		"n64to3ds diag: seconds=%.1f presents_per_s=%.2f gfx_tasks_per_s=%.2f vi_per_s=%.2f vi_cpl=%lu vi_trim=%.3f audio_in_per_s=%.0f audio_out_per_s=%.0f ai_frames_per_s=%.2f underruns=%lu ring_min=%ld"
++		" ring_full_waits=%lu ring_dropped=%lu ai_full_reads=%lu sp_yields=%lu yield_resumes=%lu"
++		" yield_resumed_done=%lu audio_wait_ms=%.1f gfx_wait_ms=%.1f",
++		seconds, (gCTRPresents - last_presents) * per_second, frames * per_second, (vi - last_vi) * per_second,
++		(unsigned long)CPU_GetVICyclesPerLine(), (double)CPU_GetVITrim(),
++		(gAudioSamplesIn - last_in) * per_second, (gAudioSamplesOut - last_out) * per_second,
++		(gAILenWrites - last_len_writes) * per_second,
++		(unsigned long)(gAudioUnderruns - last_underruns), (long)(s32)ring_min,
++		(unsigned long)(gAudioRingFullWaits - last_full_waits),
++		(unsigned long)(gAudioRingDroppedSamples - last_dropped),
++		(unsigned long)(gAIStatusFullReads - last_ai_full),
++		(unsigned long)(gGfxYieldAcks - last_yield_acks),
++		(unsigned long)(gGfxYieldResumes - last_yield_resumes),
++		(unsigned long)(gGfxYieldResumedDone - last_yield_done),
++		(gAudioWaitTicks - last_audio_wait) * 1000.0 / tick_hz,
++		(gGfxWaitTicks - last_gfx_wait) * 1000.0 / tick_hz);
++	std::cout << line << std::endl;
++	last_vi = vi;
++	last_presents = gCTRPresents;
++	last_in = gAudioSamplesIn;
++	last_out = gAudioSamplesOut;
++	last_len_writes = gAILenWrites;
++	last_underruns = gAudioUnderruns;
++	last_full_waits = gAudioRingFullWaits;
++	last_dropped = gAudioRingDroppedSamples;
++	last_ai_full = gAIStatusFullReads;
++	last_yield_acks = gGfxYieldAcks;
++	last_yield_resumes = gGfxYieldResumes;
++	last_yield_done = gGfxYieldResumedDone;
++	last_audio_wait = gAudioWaitTicks;
++	last_gfx_wait = gGfxWaitTicks;
++}
++
  void HandleEndOfFrame()
  {
  	shouldQuit = !aptMainLoop();
-@@ -127,6 +168,49 @@ void HandleEndOfFrame()
+ 	
++	if (!shouldQuit && sAutoReturnDeadline != 0 && svcGetSystemTick() >= sAutoReturnDeadline)
++	{
++		sAutoReturnDeadline = 0;
++		std::cout << "n64to3ds autoreturn: time is up, returning to the agent" << std::endl;
++		aptSetChainloader(kAgentTitleId, MEDIATYPE_SD);
++		shouldQuit = true;
++	}
++
+ 	if (shouldQuit)
  	{
  		CPU_Halt("Exiting");
  	}
@@ -4150,13 +4772,13 @@ index 73645eb..4d5b47f 100644
 +	n64to3ds::DualScreen_OnEndOfFrame();
 +#endif
 +
-+#ifdef N64TO3DS_AOT
 +	// A compact diagnostic log rather than a second on-screen overlay.  It
 +	// records the fields needed to tell emulation speed apart from displayed
-+	// FPS and to see whether AOT blocks are actually being executed.
++	// FPS, to see whether AOT blocks are actually being executed, and what
++	// the audio path did (LogDiagWindow, to daedalus.log).
 +	static u64 last_tick = 0;
 +	static u32 frame_count = 0;
-+	static bool logged_first_aot_frame = false;
++	static bool logged_first_window = false;
 +	const u64 now = svcGetSystemTick();
 +	if (last_tick == 0)
 +		last_tick = now;
@@ -4165,21 +4787,23 @@ index 73645eb..4d5b47f 100644
 +	// speeds seen on Old 3DS).  Each line reopens and appends to the SD log;
 +	// at every 30 frames that cost 6.6% of the time on hardware (HM64,
 +	// sampled profile), more than all texture work.
-+	if (!logged_first_aot_frame || frame_count >= 900)
++	if (!logged_first_window || frame_count >= 900)
 +	{
-+		logged_first_aot_frame = true;
++		logged_first_window = true;
++		const u64 elapsed_ticks = now - last_tick;
++#ifdef N64TO3DS_AOT
 +		const double tick_hz = static_cast<double>(SYSCLOCK_ARM11);
-+		const double elapsed_ticks = static_cast<double>(now - last_tick);
-+		const float frame_ms = static_cast<float>(elapsed_ticks * 1000.0 / (tick_hz * frame_count));
++		const float frame_ms = static_cast<float>(static_cast<double>(elapsed_ticks) * 1000.0 / (tick_hz * frame_count));
 +		n64to3ds::AOTRuntime_LogFrame(gCurrentFramerate, frame_ms, gCPUState.CurrentPC, frame_count);
++#endif
++		LogDiagWindow(elapsed_ticks, frame_count);
 +		last_tick = now;
 +		frame_count = 0;
 +	}
-+#endif
  }
  
  extern u32 __ctru_heap_size;
-@@ -141,6 +225,45 @@ int main(int argc, char* argv[])
+@@ -141,6 +320,46 @@ int main(int argc, char* argv[])
  	char fullpath[512];
  
  	Initialize();
@@ -4205,6 +4829,7 @@ index 73645eb..4d5b47f 100644
 +#ifdef N64TO3DS_DUALSCREEN
 +		n64to3ds::DualScreen_Initialise();
 +#endif
++		SetupAutoReturn();
 +		CPU_Run();
 +		// n64to3ds: one line per shutdown step.  A HOME-menu close once hung
 +		// after "Freeing Memory" (Memory_Fini) with nothing else logged, so
@@ -4225,7 +4850,7 @@ index 73645eb..4d5b47f 100644
  	while(shouldQuit == false)
  	{
  	// Set the default path
-@@ -152,9 +275,17 @@ int main(int argc, char* argv[])
+@@ -152,9 +371,17 @@ int main(int argc, char* argv[])
  	CPU_Run();
  	System_Close();
  	}
@@ -4243,225 +4868,6 @@ index 73645eb..4d5b47f 100644
  
  	return 0;
  }
-diff --git a/Source/RomFile/ROMBuffer.cpp b/Source/RomFile/ROMBuffer.cpp
-index 5b31422..5ef3971 100644
---- a/Source/RomFile/ROMBuffer.cpp
-+++ b/Source/RomFile/ROMBuffer.cpp
-@@ -458,7 +458,8 @@ bool RomBuffer::CopyToRam( u8 * p_dst, u32 dst_offset, u32 dst_size, u32 src_off
- 			u32		chunk_offset = 0;
- 			u32		chunk_size = 0;
- 
--			if( !spRomFileCache->GetChunk( src_offset, &p_chunk_base, &chunk_offset, &chunk_size ) )
-+			// The remaining length lets consecutive misses share one file read
-+			if( !spRomFileCache->GetChunk( src_offset, &p_chunk_base, &chunk_offset, &chunk_size, length ) )
- 			{
- 				// Out of range
- 				break;
-diff --git a/Source/RomFile/RomFileCache.cpp b/Source/RomFile/RomFileCache.cpp
-index 25c4ba0..0b61a43 100644
---- a/Source/RomFile/RomFileCache.cpp
-+++ b/Source/RomFile/RomFileCache.cpp
-@@ -26,6 +26,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- #include "RomFile/RomFileCache.h"
- #include "RomFile/RomFileMemory.h"
- 
-+#include <algorithm>
-+#include <cstring>
-+#include <new>
-+
- 
- #ifdef DAEDALUS_PSP
- extern bool PSP_IS_SLIM;
-@@ -38,6 +42,9 @@ namespace
- 	static  u32	STORAGE_BYTES;
- 
- 	static const u32	INVALID_ADDRESS = u32( ~0 );
-+
-+	// n64to3ds: upper bound of one LoadChunkRun read (32 chunks of 2 KB).
-+	static const u32	MAX_RUN_BYTES = 64 * 1024;
- }
- 
- struct SChunkInfo
-@@ -66,6 +73,7 @@ ROMFileCache::ROMFileCache()
- ,	mChunkMapEntries( 0 )
- ,	mpChunkMap( NULL )
- ,	mMRUIdx( 0 )
-+,	mpRunBuffer( nullptr )
- {
- #ifdef DAEDALUS_PSP
- 	CHUNK_SIZE = 8 * 1024;
-@@ -90,6 +98,8 @@ ROMFileCache::ROMFileCache()
- #endif
- 	mpStorage   = (u8*)CROMFileMemory::Get()->Alloc( STORAGE_BYTES );
- 	mpChunkInfo = new SChunkInfo[ CACHE_SIZE ];
-+	// Optional: without it every miss uses the one-chunk path.
-+	mpRunBuffer = new (std::nothrow) u8[ MAX_RUN_BYTES ];
- }
- 
- //*****************************************************************************
-@@ -100,6 +110,7 @@ ROMFileCache::~ROMFileCache()
- 	CROMFileMemory::Get()->Free( mpStorage );
- 
- 	delete [] mpChunkInfo;
-+	delete [] mpRunBuffer;
- }
- 
- //*****************************************************************************
-@@ -190,10 +201,84 @@ void	ROMFileCache::PurgeChunk( CacheIdx cache_idx )
- 	chunk_info.LastUseIdx = 0;
- }
- 
-+//*****************************************************************************
-+// n64to3ds: on Old 3DS each romfs read costs ~15 ms almost independently of
-+// its 2 KB size, and one PI DMA can miss dozens of consecutive chunks.  Load
-+// up to max_chunks consecutive uncached chunks, starting at chunk_map_idx,
-+// with one ReadChunk and install them in the same LRU order the one-chunk
-+// path would.  Returns INVALID_IDX, having changed nothing, when fewer than
-+// two chunks qualify or the read fails; the caller then takes that path.
-+//*****************************************************************************
-+ROMFileCache::CacheIdx	ROMFileCache::LoadChunkRun( u32 chunk_map_idx, u32 max_chunks )
-+{
-+	if( mpRunBuffer == nullptr )
-+	{
-+		return INVALID_IDX;
-+	}
-+
-+	const u64	rom_size( mpROMFile->GetRomSize() );
-+	const u32	limit( std::min( max_chunks, MAX_RUN_BYTES / CHUNK_SIZE ) );
-+	u32			count( 0 );
-+	while( count < limit )
-+	{
-+		const u32	map_idx( chunk_map_idx + count );
-+		// Stop at a cached chunk, and leave a partial last chunk to the
-+		// one-chunk path: its short read fails there and must stay so.
-+		if( map_idx >= mChunkMapEntries || mpChunkMap[ map_idx ] != INVALID_IDX ||
-+			u64( map_idx + 1 ) * CHUNK_SIZE > rom_size )
-+		{
-+			break;
-+		}
-+		++count;
-+	}
-+	if( count < 2 )
-+	{
-+		return INVALID_IDX;
-+	}
-+
-+	if( !mpROMFile->ReadChunk( chunk_map_idx * CHUNK_SIZE, mpRunBuffer, count * CHUNK_SIZE ) )
-+	{
-+		return INVALID_IDX;
-+	}
-+
-+	CacheIdx	first_idx( INVALID_IDX );
-+	for( u32 i = 0; i < count; ++i )
-+	{
-+		// Same victim choice as GetCacheIndex.  Chunks installed earlier in
-+		// this run are the most recent, so they are never chosen here.
-+		CacheIdx	selected_idx( 0 );
-+		u32			oldest_timestamp( mpChunkInfo[ 0 ].LastUseIdx );
-+		for(CacheIdx j = 1; j < CACHE_SIZE; ++j)
-+		{
-+			u32		timestamp( mpChunkInfo[ j ].LastUseIdx );
-+			if(timestamp < oldest_timestamp)
-+			{
-+				oldest_timestamp = timestamp;
-+				selected_idx = j;
-+			}
-+		}
-+
-+		PurgeChunk( selected_idx );
-+
-+		SChunkInfo &		chunk_info( mpChunkInfo[ selected_idx ] );
-+		chunk_info.StartOffset = ( chunk_map_idx + i ) * CHUNK_SIZE;
-+		chunk_info.LastUseIdx = ++mMRUIdx;
-+		mpChunkMap[ chunk_map_idx + i ] = selected_idx;
-+
-+		memcpy( mpStorage + selected_idx * CHUNK_SIZE, mpRunBuffer + i * CHUNK_SIZE, CHUNK_SIZE );
-+
-+		if( i == 0 )
-+		{
-+			first_idx = selected_idx;
-+		}
-+	}
-+	return first_idx;
-+}
-+
- //*****************************************************************************
- //
- //*****************************************************************************
--ROMFileCache::CacheIdx	ROMFileCache::GetCacheIndex( u32 address )
-+ROMFileCache::CacheIdx	ROMFileCache::GetCacheIndex( u32 address, u32 max_chunks )
- {
- 	u32		chunk_map_idx( AddressToChunkMapIndex( address ) );
- 	#ifdef DAEDALUS_ENABLE_ASSERTS
-@@ -203,6 +288,14 @@ ROMFileCache::CacheIdx	ROMFileCache::GetCacheIndex( u32 address )
- 	//	Check if this chunk is already cached, load if necessary
- 	//
- 	CacheIdx	idx( mpChunkMap[ chunk_map_idx ] );
-+	if(idx == INVALID_IDX && max_chunks > 1)
-+	{
-+		idx = LoadChunkRun( chunk_map_idx, max_chunks );
-+		if(idx != INVALID_IDX)
-+		{
-+			return idx;
-+		}
-+	}
- 	if(idx == INVALID_IDX)
- 	{
- 		CacheIdx	selected_idx( 0 );
-@@ -251,13 +344,20 @@ ROMFileCache::CacheIdx	ROMFileCache::GetCacheIndex( u32 address )
- //*****************************************************************************
- //
- //*****************************************************************************
--bool	ROMFileCache::GetChunk( u32 rom_offset, u8 ** p_p_chunk_base, u32 * p_chunk_offset, u32 * p_chunk_size )
-+bool	ROMFileCache::GetChunk( u32 rom_offset, u8 ** p_p_chunk_base, u32 * p_chunk_offset, u32 * p_chunk_size, u32 request_bytes )
- {
- 	u32		chunk_map_idx( AddressToChunkMapIndex( rom_offset ) );
- 
- 	if(chunk_map_idx < mChunkMapEntries)
- 	{
--		CacheIdx	idx( GetCacheIndex( rom_offset ) );
-+		// Chunks spanned by [rom_offset, rom_offset + request_bytes)
-+		u32		max_chunks( 1 );
-+		if( request_bytes > 1 )
-+		{
-+			const u64	last( u64( rom_offset ) + request_bytes - 1 );
-+			max_chunks = u32( std::min< u64 >( last / CHUNK_SIZE - chunk_map_idx + 1, MAX_RUN_BYTES / CHUNK_SIZE ) );
-+		}
-+		CacheIdx	idx( GetCacheIndex( rom_offset, max_chunks ) );
- 		#ifdef DAEDALUS_ENABLE_ASSERTS
- 		DAEDALUS_ASSERT( idx < CACHE_SIZE, "Invalid chunk index!" );
- 		#endif
-diff --git a/Source/RomFile/RomFileCache.h b/Source/RomFile/RomFileCache.h
-index de3246b..0e5bc41 100644
---- a/Source/RomFile/RomFileCache.h
-+++ b/Source/RomFile/RomFileCache.h
-@@ -37,12 +37,15 @@ class ROMFileCache
- 		bool				Open( std::shared_ptr<ROMFile> p_rom_file );
- 		void				Close();
- 
--		bool				GetChunk( u32 rom_offset, u8 ** p_p_chunk_base, u32 * p_chunk_offset, u32 * p_chunk_size );
-+		// request_bytes > 0 lets consecutive uncached chunks of that request
-+		// be loaded with one file read; 0 keeps the one-chunk-per-read path.
-+		bool				GetChunk( u32 rom_offset, u8 ** p_p_chunk_base, u32 * p_chunk_offset, u32 * p_chunk_size, u32 request_bytes = 0 );
- 
- 	private:
- 		void				PurgeChunk( CacheIdx cache_idx );
- 
--		CacheIdx			GetCacheIndex( u32 address );
-+		CacheIdx			GetCacheIndex( u32 address, u32 max_chunks = 1 );
-+		CacheIdx			LoadChunkRun( u32 chunk_map_idx, u32 max_chunks );
- 
- 	private:
- 		std::shared_ptr<ROMFile> 		mpROMFile;
-@@ -55,6 +58,8 @@ class ROMFileCache
- 
- 		u32					mMRUIdx;			// Most recently used index
- 
-+		u8 *				mpRunBuffer;		// Staging buffer for LoadChunkRun (may be null)
-+
- 		static const CacheIdx	INVALID_IDX = CacheIdx(-1);
- };
- 
 diff --git a/Source/System/SystemInit.cpp b/Source/System/SystemInit.cpp
 index 1c9f462..ee0d7f6 100644
 --- a/Source/System/SystemInit.cpp
@@ -4484,3 +4890,399 @@ index 1c9f462..ee0d7f6 100644
  		entry.final();
  	}
  }
+diff --git a/Source/Utility/FramerateLimiter.cpp b/Source/Utility/FramerateLimiter.cpp
+index 859ab48..ae02d6b 100644
+--- a/Source/Utility/FramerateLimiter.cpp
++++ b/Source/Utility/FramerateLimiter.cpp
+@@ -1,148 +1,159 @@
+-/*
+-Copyright (C) 2007 StrmnNrmn
+-
+-This program is free software; you can redistribute it and/or
+-modify it under the terms of the GNU General Public License
+-as published by the Free Software Foundation; either version 2
+-of the License, or (at your option) any later version.
+-
+-This program is distributed in the hope that it will be useful,
+-but WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with this program; if not, write to the Free Software
+-Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+-
+-*/
+-
+-
+-#include "Base/Types.h"
+-#include "FramerateLimiter.h"
+-
+-#include "System/Timing/Timing.h"
+-#include "System/Thread/Thread.h"
+-
+-#include "Core/Memory.h"
+-#include "Core/ROM.h"
+-
+-static u32				gTicksBetweenVbls = 0;			// How many ticks we want to delay between vertical blanks
+-static u32				gTicksPerSecond = 0;			// How many ticks there are per second
+-static u64				gLastVITime = 0;				// The time of the last vertical blank
+-static u32				gLastOrigin = 0;				// The origin that we saw on the last vertical blank
+-static u32				gVblsSinceFlip = 0;				// The number of vertical blanks that have occurred since the last n64 flip
+-static u32				gCurrentAverageTicksPerVbl = 0;
+-static FramerateSyncFn 	gAuxSyncFn = NULL;
+-static void *			gAuxSyncArg = NULL;
+-
+-static const u32		gTvFrequencies[] =
+-{
+-	50,		// OS_TV_PAL,
+-	60,		// OS_TV_NTSC,
+-	50		// OS_TV_MPAL
+-};
+-
+-void FramerateLimiter_SetAuxillarySyncFunction(FramerateSyncFn fn, void * arg)
+-{
+-	gAuxSyncFn  = fn;
+-	gAuxSyncArg = arg;
+-}
+-
+-bool FramerateLimiter_Reset()
+-{
+-	u64 frequency;
+-
+-	gLastVITime = 0;
+-	gLastOrigin = 0;
+-	gVblsSinceFlip = 0;
+-
+-	//gAuxSyncFn  = NULL;	// Should we reset this? Will audio re-init?
+-	//gAuxSyncArg = NULL;
+-
+-	if(NTiming::GetPreciseFrequency(&frequency))
+-	{
+-		#ifdef DAEDALUS_ENABLE_ASSERTS
+-		DAEDALUS_ASSERT(g_ROM.TvType <= sizeof(gTvFrequencies) / sizeof(u32), "Unknown TV type: %d", g_ROM.TvType);
+-		#endif
+-
+-		gTicksBetweenVbls = (u32)(frequency / (u64)gTvFrequencies[ g_ROM.TvType ]);
+-		gTicksPerSecond = (u32)frequency;
+-	}
+-	else
+-	{
+-		gTicksBetweenVbls = 0;
+-		gTicksPerSecond = 0;
+-	}
+-	return true;
+-}
+-
+-static u32 FramerateLimiter_UpdateAverageTicksPerVbl( u32 elapsed_ticks )
+-{
+-	static u32 s[4];
+-	static u32 ptr = 0;
+-
+-	s[ptr++] = elapsed_ticks;
+-	ptr &= 0x3;
+-
+-	//Average 4 frames
+-	return (s[0] + s[1] + s[2] + s[3] + 2) >> 2;
+-}
+-
+-void FramerateLimiter_Limit()
+-{
+-	gVblsSinceFlip++;
+-
+-	// Only do framerate limiting on frames that correspond to a flip
+-	u32 current_origin = Memory_VI_GetRegister(VI_ORIGIN_REG);
+-
+-	if (gAuxSyncFn)
+-	{
+-		gAuxSyncFn(gAuxSyncArg);
+-	}
+-
+-	if( current_origin == gLastOrigin )
+-		return;
+-
+-	u64	now;
+-	NTiming::GetPreciseTime(&now);
+-
+-	u32 elapsed_ticks = (u32)(now - gLastVITime);
+-
+-	gCurrentAverageTicksPerVbl = FramerateLimiter_UpdateAverageTicksPerVbl( elapsed_ticks / gVblsSinceFlip );
+-
+-	if( gSpeedSyncEnabled && !gAuxSyncFn )
+-	{
+-		u32 required_ticks = gTicksBetweenVbls * gVblsSinceFlip;
+-
+-		if( gSpeedSyncEnabled == 2 ) required_ticks = required_ticks << 1;	// Slow down to 1/2 speed //Corn
+-
+-		// FIXME the constant here will need to be adjusted for different platforms.
+-		s32	delay_ticks = required_ticks - elapsed_ticks - 50;	//Remove ~50 ticks for additional processing
+-
+-		if( delay_ticks > 0 )
+-		{
+-			//printf( "Delay ticks: %d\n", delay_ticks );
+-			ThreadSleepTicks( delay_ticks & 0xFFFF );
+-			NTiming::GetPreciseTime(&now);
+-		}
+-	}
+-
+-	gLastOrigin = current_origin;
+-	gLastVITime = now;
+-	gVblsSinceFlip = 0;
+-}
+-
+-f32	FramerateLimiter_GetSync()
+-{
+-	if( gCurrentAverageTicksPerVbl == 0 )
+-	{
+-		return 0.0f;
+-	}
+-	return f32( gTicksBetweenVbls ) / f32( gCurrentAverageTicksPerVbl );
+-}
+-
+-u32 FramerateLimiter_GetTvFrequencyHz()
+-{
+-	return gTvFrequencies[ g_ROM.TvType ];
+-}
++/*
++Copyright (C) 2007 StrmnNrmn
++
++This program is free software; you can redistribute it and/or
++modify it under the terms of the GNU General Public License
++as published by the Free Software Foundation; either version 2
++of the License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with this program; if not, write to the Free Software
++Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
++
++*/
++
++
++#include "Base/Types.h"
++#include "FramerateLimiter.h"
++
++#include "System/Timing/Timing.h"
++#include "System/Thread/Thread.h"
++
++#include "Core/Memory.h"
++#include "Core/ROM.h"
++
++static u32				gTicksBetweenVbls = 0;			// How many ticks we want to delay between vertical blanks
++static u32				gTicksPerSecond = 0;			// How many ticks there are per second
++static u64				gLastVITime = 0;				// The time of the last vertical blank
++static u32				gLastOrigin = 0;				// The origin that we saw on the last vertical blank
++static u32				gVblsSinceFlip = 0;				// The number of vertical blanks that have occurred since the last n64 flip
++static u32				gCurrentAverageTicksPerVbl = 0;
++static FramerateSyncFn 	gAuxSyncFn = NULL;
++static void *			gAuxSyncArg = NULL;
++#ifdef DAEDALUS_CTR
++static float			gSpeedTrim = 0.0f;			// n64to3ds: see FramerateLimiter_SetSpeedTrim
++
++void FramerateLimiter_SetSpeedTrim(float trim)
++{
++	gSpeedTrim = trim;
++}
++#endif
++
++static const u32		gTvFrequencies[] =
++{
++	50,		// OS_TV_PAL,
++	60,		// OS_TV_NTSC,
++	50		// OS_TV_MPAL
++};
++
++void FramerateLimiter_SetAuxillarySyncFunction(FramerateSyncFn fn, void * arg)
++{
++	gAuxSyncFn  = fn;
++	gAuxSyncArg = arg;
++}
++
++bool FramerateLimiter_Reset()
++{
++	u64 frequency;
++
++	gLastVITime = 0;
++	gLastOrigin = 0;
++	gVblsSinceFlip = 0;
++
++	//gAuxSyncFn  = NULL;	// Should we reset this? Will audio re-init?
++	//gAuxSyncArg = NULL;
++
++	if(NTiming::GetPreciseFrequency(&frequency))
++	{
++		#ifdef DAEDALUS_ENABLE_ASSERTS
++		DAEDALUS_ASSERT(g_ROM.TvType <= sizeof(gTvFrequencies) / sizeof(u32), "Unknown TV type: %d", g_ROM.TvType);
++		#endif
++
++		gTicksBetweenVbls = (u32)(frequency / (u64)gTvFrequencies[ g_ROM.TvType ]);
++		gTicksPerSecond = (u32)frequency;
++	}
++	else
++	{
++		gTicksBetweenVbls = 0;
++		gTicksPerSecond = 0;
++	}
++	return true;
++}
++
++static u32 FramerateLimiter_UpdateAverageTicksPerVbl( u32 elapsed_ticks )
++{
++	static u32 s[4];
++	static u32 ptr = 0;
++
++	s[ptr++] = elapsed_ticks;
++	ptr &= 0x3;
++
++	//Average 4 frames
++	return (s[0] + s[1] + s[2] + s[3] + 2) >> 2;
++}
++
++void FramerateLimiter_Limit()
++{
++	gVblsSinceFlip++;
++
++	// Only do framerate limiting on frames that correspond to a flip
++	u32 current_origin = Memory_VI_GetRegister(VI_ORIGIN_REG);
++
++	if (gAuxSyncFn)
++	{
++		gAuxSyncFn(gAuxSyncArg);
++	}
++
++	if( current_origin == gLastOrigin )
++		return;
++
++	u64	now;
++	NTiming::GetPreciseTime(&now);
++
++	u32 elapsed_ticks = (u32)(now - gLastVITime);
++
++	gCurrentAverageTicksPerVbl = FramerateLimiter_UpdateAverageTicksPerVbl( elapsed_ticks / gVblsSinceFlip );
++
++	if( gSpeedSyncEnabled && !gAuxSyncFn )
++	{
++		u32 required_ticks = gTicksBetweenVbls * gVblsSinceFlip;
++#ifdef DAEDALUS_CTR
++		required_ticks = (u32)( (float)required_ticks / (1.0f + gSpeedTrim) );	// n64to3ds
++#endif
++
++		if( gSpeedSyncEnabled == 2 ) required_ticks = required_ticks << 1;	// Slow down to 1/2 speed //Corn
++
++		// FIXME the constant here will need to be adjusted for different platforms.
++		s32	delay_ticks = required_ticks - elapsed_ticks - 50;	//Remove ~50 ticks for additional processing
++
++		if( delay_ticks > 0 )
++		{
++			//printf( "Delay ticks: %d\n", delay_ticks );
++			ThreadSleepTicks( delay_ticks & 0xFFFF );
++			NTiming::GetPreciseTime(&now);
++		}
++	}
++
++	gLastOrigin = current_origin;
++	gLastVITime = now;
++	gVblsSinceFlip = 0;
++}
++
++f32	FramerateLimiter_GetSync()
++{
++	if( gCurrentAverageTicksPerVbl == 0 )
++	{
++		return 0.0f;
++	}
++	return f32( gTicksBetweenVbls ) / f32( gCurrentAverageTicksPerVbl );
++}
++
++u32 FramerateLimiter_GetTvFrequencyHz()
++{
++	return gTvFrequencies[ g_ROM.TvType ];
++}
+diff --git a/Source/Utility/FramerateLimiter.h b/Source/Utility/FramerateLimiter.h
+index 2a48db4..1289760 100644
+--- a/Source/Utility/FramerateLimiter.h
++++ b/Source/Utility/FramerateLimiter.h
+@@ -1,37 +1,42 @@
+-/*
+-Copyright (C) 2007 StrmnNrmn
+-
+-This program is free software; you can redistribute it and/or
+-modify it under the terms of the GNU General Public License
+-as published by the Free Software Foundation; either version 2
+-of the License, or (at your option) any later version.
+-
+-This program is distributed in the hope that it will be useful,
+-but WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with this program; if not, write to the Free Software
+-Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+-
+-*/
+-
+-#ifndef UTILITY_FRAMERATELIMITER_H_
+-#define UTILITY_FRAMERATELIMITER_H_
+-
+-#include "Base/Types.h"
+-
+-extern u32		gSpeedSyncEnabled;
+-
+-bool			FramerateLimiter_Reset();
+-void			FramerateLimiter_Limit();
+-f32				FramerateLimiter_GetSync();	// Returns fraction of real n64 we're running at (1 = 100%)
+-u32				FramerateLimiter_GetTvFrequencyHz();
+-
+-// Override the sync function, e.g. if the audio plugin wants to control sync.
+-using FramerateSyncFn = void (*)(void * arg);
+-
+-void			FramerateLimiter_SetAuxillarySyncFunction(FramerateSyncFn fn, void * arg);
+-
+-#endif // UTILITY_FRAMERATELIMITER_H_
++/*
++Copyright (C) 2007 StrmnNrmn
++
++This program is free software; you can redistribute it and/or
++modify it under the terms of the GNU General Public License
++as published by the Free Software Foundation; either version 2
++of the License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with this program; if not, write to the Free Software
++Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
++
++*/
++
++#ifndef UTILITY_FRAMERATELIMITER_H_
++#define UTILITY_FRAMERATELIMITER_H_
++
++#include "Base/Types.h"
++
++extern u32		gSpeedSyncEnabled;
++
++bool			FramerateLimiter_Reset();
++void			FramerateLimiter_Limit();
++f32				FramerateLimiter_GetSync();	// Returns fraction of real n64 we're running at (1 = 100%)
++u32				FramerateLimiter_GetTvFrequencyHz();
++#ifdef DAEDALUS_CTR
++// n64to3ds: run the guest this fraction faster (positive) or slower than
++// real time; set by the real-time VI pacing in Core/CPU.cpp.
++void			FramerateLimiter_SetSpeedTrim(float trim);
++#endif
++
++// Override the sync function, e.g. if the audio plugin wants to control sync.
++using FramerateSyncFn = void (*)(void * arg);
++
++void			FramerateLimiter_SetAuxillarySyncFunction(FramerateSyncFn fn, void * arg);
++
++#endif // UTILITY_FRAMERATELIMITER_H_
