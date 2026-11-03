@@ -62,6 +62,8 @@ class RomDbResult:
     matched_key: str | None
     properties: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # The database's display name ("GoldenEye 007"), if the ROM was found.
+    name: str | None = None
 
     @property
     def save_type(self) -> str | None:
@@ -141,6 +143,7 @@ def lookup_rom_settings(
         )
     if save_type_override:
         selected["SaveType"] = save_type_override
+    name = (properties.get("Name") or "").strip() or None
     return RomDbResult(
         runtime_key=ids.runtime_key,
         header_key=ids.header_key,
@@ -148,6 +151,7 @@ def lookup_rom_settings(
         matched_key=matched_key,
         properties=selected,
         warnings=warnings,
+        name=name,
     )
 
 
@@ -163,7 +167,7 @@ def render_generated_entry(
     *,
     game_name: str | None = None,
 ) -> str:
-    name = _escape_ini(game_name or result.properties.get("Name") or rom.display_name)
+    name = _escape_ini(game_name or result.name or rom.display_name)
     lines = [
         f"{{{result.runtime_key.upper()}}}",
         f"Name={name}",

@@ -211,6 +211,29 @@ bool ValidateBlock(u32 index, const AOTBlockDescriptor & block)
     return true;
 }
 
+// One bit per word address (modulo 256 KB) that starts a block.  The
+// dispatcher runs before every interpreted instruction; a clear bit rejects
+// the PC with one load instead of a binary search (GoldenEye's TLB miss
+// handler, interpreted ~450000 instructions a second on an Old 3DS, spent a
+// third of core 0 in the dispatcher with no block ever executing).
+u8 s_start_bits[8192];
+
+void BuildStartBits()
+{
+    std::memset(s_start_bits, 0, sizeof(s_start_bits));
+    for (u32 i = 0; i < g_n64to3ds_aot_block_count; ++i)
+    {
+        const u32 word = g_n64to3ds_aot_blocks[i].start >> 2;
+        s_start_bits[(word >> 3) & 0x1FFF] |= u8(1u << (word & 7));
+    }
+}
+
+inline bool MayStartBlock(u32 pc)
+{
+    const u32 word = pc >> 2;
+    return (s_start_bits[(word >> 3) & 0x1FFF] >> (word & 7)) & 1;
+}
+
 u32 FindFirstBlock(u32 pc, bool & found)
 {
     found = false;
@@ -278,6 +301,7 @@ void AOTRuntime_Initialize()
     }
 
     ResetStats();
+    BuildStartBits();
     s_initialized = true;
     s_invalidation_pending = false;
     ++s_generation;
@@ -334,6 +358,11 @@ bool AOTRuntime_TryExecute()
     s_invalidation_pending = false;
 
     const u32 pc = gCPUState.CurrentPC;
+    if (!MayStartBlock(pc))
+    {
+        ++s_lookup_misses;
+        return false;
+    }
     bool found = false;
     u32 index = FindFirstBlock(pc, found);
     if (!found)

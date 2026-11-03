@@ -231,7 +231,8 @@ boundary the interpreter would use if a TLB exception or other job is queued.
 
 ```
 n64to3ds build <rom> [--target old3ds] [--output <cia>] [--aot off|auto]
-                    [--title-id <id>] [--rom-db <ini>] [--save-type <type>]
+                    [--title-id <id>] [--app-name <name>] [--icon <png>]
+                    [--banner-image <png>] [--rom-db <ini>] [--save-type <type>]
                     [--jobs N] [--keep-build] [--build-dir <dir>] [--verbose]
 n64to3ds analyze <rom> [--json] [--output <json>] [--hypotheses N]
                        [--max-blocks N] [--max-instructions N]
@@ -246,6 +247,20 @@ scores, safe blocks, instruction counts, and unsupported instruction counts.
 
 `doctor` checks the host toolchain, the pinned Daedalus tree, and the runtime
 sources.
+
+### HOME Menu name, icon and banner
+
+The HOME Menu shows the game's name from the Daedalus ROM database
+("GoldenEye 007"), or the ROM header name for ROMs it does not know;
+`--app-name` overrides it.  The 48x48 icon and the top-screen banner are drawn
+with that name on a card in one of the Nintendo 64 logo colours, chosen from
+the ROM hash.  `--icon` and `--banner-image` take PNG images instead (for
+example box art you own): the icon is cropped to a square and scaled to 48x48,
+the banner image is fitted into 256x128 with its transparency kept.  The
+banner keeps DaedalusX64's banner model and jingle and replaces only its
+texture.  Everything is drawn in Python with the Roboto font Daedalus already
+ships, so the release bundle needs no imaging library.  The HOME Menu may keep
+showing an old icon for a reinstalled title until the console restarts.
 
 ## Title IDs
 
@@ -288,12 +303,123 @@ because an AI_LEN write copies the samples out at once.  Measured on an Old
 3DS in HM64's attract scenes: 746 to 10 ring underruns per minute, 54 to 59.5
 VI/s, 25.4 to 22.8 presents/s (the audio HLE now runs ~60 instead of ~45 times
 a second next to the display list on core 1).  A `n64to3ds diag:` line in
-`sdmc:/3ds/DaedalusX64/daedalus.log` every 900 end-of-frame callbacks records
+`sdmc:/3ds/DaedalusX64/daedalus.log` about every 10 s of real time records
 these counters; `scripts/triage_log.py` reads it.
 
-For unattended console runs, a file `sdmc:/3ds/n64to3ds-agent/autoreturn`
-holding a number of seconds makes the game quit after that long and return to
-the n64to3ds agent (`tools/console-agent`), which serves the logs.
+Other general fixes, found with the console profiler on GoldenEye 007:
+
+- `TLBWR` wrote every random TLB refill into the same entry (the index was a
+  `static` computed once), so games that refill the TLB from their miss
+  handler thrashed: GoldenEye took ~12000 TLB misses a second and ran at ~1%
+  of N64 speed behind a black screen.  The index now follows the R4300's
+  Random register (counting down from 31 to Wired).
+- TLB-mapped accesses go through a 4 KB page translation cache.
+- The AOT dispatcher rejects PCs that start no AOT block with a bitmap before
+  its binary search; it runs before every interpreted instruction.
+- ROMs of 8 MB or more were streamed from RomFS in 2 KB chunks on Old 3DS
+  (~15 ms per miss).  They are now read into linear memory once when it has
+  room to spare (the boot takes 1-2 s longer).
+- The ARM dynarec compiles `div`/`divu` (through a helper that leaves the
+  cached registers alone) and treats data-cache `cache` operations as the
+  no-ops they are in the interpreter, instead of calling the interpreter.
+- HOME and the power button are also handled once a second from the VI
+  interrupt, so a game that renders rarely can still be closed.
+
+ARM dynarec code generation (measured with `guest_mips`, the guest
+instructions executed per second, in GoldenEye's Dam mission; a code dump of
+the hottest fragments showed ~3 ARM instructions per MIPS instruction in
+fragment bodies but a fragment entered every ~15 guest instructions, so most
+of the time went to fragment transitions and memory stalls):
+
+- A branch-likely that the recorded trace did not take left the fragment
+  into its delay slot, so every iteration of a loop ending in such a branch
+  ran one instruction in the interpreter and re-entered the dynarec (10% of
+  core 0 in GoldenEye).  The exit now runs the delay slot natively and jumps
+  to the branch target, which links to its fragment.
+- Indirect exits (mostly `jr ra` returning to another caller than the one
+  the trace recorded, ~140k a second in GoldenEye) update the counters
+  inline and find their target in a 1024-entry table instead of two C calls
+  with a spin lock.
+- Direct exits update COUNT and the event counter inline instead of calling
+  a stub.
+- Plain arithmetic, loads and stores in delay slots no longer store the
+  `Delay` flag around them (loads and stores set it in their slow path).
+- The high word of a 32-bit result is stored when the register is flushed
+  instead of after every write.
+
+Together: GoldenEye Dam 9.1-9.9 -> 12.4-15 guest MIPS, Harvest Moon 64
+attract scenes 17.4-18.2 -> 20.7-25.5.
+
+New code and the hot-trace bookkeeping (GoldenEye frames that compile 100-400
+new fragments took 150-550 ms):
+
+- A trace cut short by an interrupt or exception was dropped, but the hot
+  count of its start address had already reached the threshold, and tracing
+  starts only when the count equals it, so that code stayed interpreted until
+  the hot-trace map filled up.  Which code that hit depended on interrupt
+  timing: in some GoldenEye runs the interpreter executed 110-180k
+  instructions a second instead of 9-20k from the title screen on.  The count
+  now starts again (`trace_aborts` in the diag line: 10-35 a second).
+- The fragment cache kept its fragments in a vector sorted by address, so
+  every new fragment moved half of it (thousands of entries); lookups that
+  miss the hash table used a binary search over it.  It now appends, and
+  looks addresses up in a hash map; the pending-link and hot-trace maps are
+  hash maps too.  Inserting and linking took 9.2% of core 0 in the busiest
+  compile window of a profiled GoldenEye run and now 0.9%; compile time per
+  fragment there ~785 -> ~510 us.
+- A new fragment and each link patch clean and invalidate only their own
+  cache lines (through the Luma kernel backdoor) instead of the whole data and
+  instruction caches.
+
+GoldenEye Dam after these: 11.4-15.2 guest MIPS (11.6-12.9 before).
+
+On an Old 3DS GoldenEye now reaches the Dam mission and runs it at about
+12-19 presents/s (7-11 before the dynarec changes); the intro and menus run
+at 15-30.
+
+Saves no longer stop the game: writing a save file to the SD card takes up
+to seconds on an Old 3DS (file creation, rename and data each go through the
+FS service), and it ran on the CPU thread from the VI handler.  The contents
+are now copied there and written by a separate thread; closing the game
+waits for it.  Every EEPROM block and SRAM DMA also logged a line to the SD
+card, which is no longer done on 3DS.
+
+The costliest audio commands have ARM11 versions of their inner loops: the
+envelope mixers (word-wide access to sample pairs, SSAT/QADD16 saturation,
+SMULWB/SMULWT scaling, constant gains once a volume ramp has settled; the
+original loop remains for unusual buffer layouts) and the ADPCM predictor
+shared by the three ABIs (16-bit multiply-accumulates on packed halfwords,
+SMLAxy/SMLADX, instead of 44 32-bit multiplies per 8 samples).
+`tests/test_audio_hle.py` builds the upstream and the patched commands for
+the host and checks that they produce the same bytes on random inputs.
+Audio thread share of core 1 in comparable windows: GoldenEye (ABI1) Dam
+34% -> 23% (core 0's wait for it 445 -> ~120 ms per 10 s), Mario Kart 64
+(ABI2) 54% -> 43%, Harvest Moon 64 (ABI3) 41% -> 38%.
+
+`BaseRenderer::FlushTris` no longer allocates and frees its vertex buffer
+for every draw (thousands a second; the heap lock is shared with core 0):
+about 5% of core 1 in Harvest Moon 64 and Super Mario 64.
+
+With the CPU faster, core 1 (graphics and audio HLE, which may use at most
+80% of it) is the limit in several games.  Profiled runs sample it too;
+Dam in GoldenEye: audio 35%, graphics 35%, idle 31%; Harvest Moon 64 attract:
+audio 40%, graphics 47%; Mario Kart 64 attract: audio 18%, graphics 47% (of
+which texture uploads 11%).
+
+### Console test tools
+
+These files in `sdmc:/3ds/n64to3ds-agent/` are read when a game starts and
+removed, so each one affects one run:
+
+| File | Content | Effect |
+| --- | --- | --- |
+| `autoreturn` | seconds | quit after that long and return to the n64to3ds agent (`tools/console-agent`), which serves the logs |
+| `profile` | anything | log an `n64to3ds prof:` line per diag window: share of core 0 per phase (dynarec, interpreter, TLB, waits...), share of core 1 per phase (`c1_audio`, `c1_dl`, `c1_vertex`, `c1_tris`, `c1_prepare`, `c1_draw`, `c1_combine`, `c1_picagl`, `c1_texture`, `c1_texupload`, ...; the audio and graphics threads drop one priority step so the sampler can preempt them), display list handler time by GBI command (`c1_cmds`), draws and vertices per window (`gfx_flushes`, `gfx_flush_verts`), most sampled guest PCs, interpreted PCs, instructions the dynarec hands to the interpreter, audio commands by core 1 time.  Costs about 20% of the emulation speed while active |
+| `screenshots` | seconds | save the top screen every that many seconds as `shot_NN.bmp`; each one stops the game for about 2 s while it is written |
+| `inputs` | lines `<start s> <duration s> KEY[+KEY]` or `<start s> <duration s> STICK dx dy` | press 3DS keys or hold the circle pad at those times, through the normal controller mapping |
+| `codedump` | `<start s> <end s>` (with `profile`) | count fragment entries between the two times, then write the 800 most executed fragments (ARM code, MIPS opcodes, entry counts) to `codedump.bin`; `scripts/codedump_report.py` reads it |
+| (none) | | every run logs an `n64to3ds stall:` line for each frame that took more than 150 ms (at most 10 per diag window): new dynarec code and cache maintenance, interpreted instructions, textures converted, waits for core 1 and the longest graphics task in that frame |
+| `dynarec_off` | mask | switch off dynarec code generation changes for A/B runs: 1 delay-slot flags, 2 deferred high words, 4 likely-branch exits, 8 inline direct exits, 16 fast indirect exits |
 
 ## Reproducibility and licenses
 
@@ -363,6 +489,9 @@ The suite currently contains 47 tests.  They cover ROM normalization, the
 multi-hypothesis analyzer, code generation, the host AOT semantic harness, title
 IDs and collision handling, RomFS/IVFC wrapping and corruption detection, ROM
 database lookup, runtime evidence parsing, and CLI behavior.
+`tests/test_audio_hle.py` (needs `g++` and the bootstrapped Daedalus tree)
+checks that the patched audio commands match upstream DaedalusX64 byte for
+byte.
 
 ## Legal
 

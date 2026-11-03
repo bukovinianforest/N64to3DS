@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .analyzer import AnalysisResult, analyze, analyze_multi
+from .artwork import make_home_artwork
 from .codegen import GeneratedProgram, ProgramMetadata, generate_program, write_generated, write_manifest
 from .errors import BuildError, N64To3DSError, ToolchainError, VerificationError
 from .extensions import select_extension, write_romfs_profile
@@ -73,6 +74,17 @@ def _ascii_title(name: str) -> str:
     value = name.encode("ascii", errors="replace").decode("ascii")
     value = re.sub(r"[\r\n\t]+", " ", value).strip()
     return value[:64] or "N64to3DS"
+
+
+def _display_title(options: "BuildOptions", db_name: str | None, rom: NormalizedRom) -> str:
+    """HOME Menu name: --app-name, else the ROM database name ("GoldenEye
+    007"), else the ROM header name ("GOLDENEYE")."""
+
+    if options.app_name:
+        return _ascii_title(options.app_name)
+    if db_name:
+        return _ascii_title(db_name)
+    return _ascii_title(_safe_app_name(rom))
 
 
 def _sanitize_product_code(unique: int) -> str:
@@ -471,14 +483,15 @@ def _create_smdh(
     log_handle,
     verbose: bool,
 ) -> None:
-    long_description = f"N64 emulation via DaedalusX64: {game_name}"
+    # The HOME Menu shows the short title and, below it, the publisher.
+    long_description = f"{game_name} (Nintendo 64)"
     _run_logged(
         [
             toolchain.smdhtool,
             "--create",
             game_name[:64],
             long_description[:128],
-            "n64to3ds / DaedalusX64 Team",
+            "Nintendo 64 via n64to3ds",
             str(icon),
             str(output),
         ],
@@ -569,8 +582,13 @@ class BuildOptions:
     keep_build: bool = False
     build_dir: Path | None = None
     title_id: str | None = None
-    # HOME menu name (SMDH short title); the ROM header name by default.
+    # HOME menu name (SMDH short title); by default the ROM database name, or
+    # the ROM header name for ROMs the database does not know.
     app_name: str | None = None
+    # PNG images for the HOME Menu icon and the top-screen banner; by default
+    # both are drawn with the game's name.
+    icon_image: Path | None = None
+    banner_image: Path | None = None
     jobs: int = max(1, min(os.cpu_count() or 1, 16))
     rom_db: Path | None = None
     save_type: str | None = None
@@ -842,7 +860,7 @@ def build(options: BuildOptions) -> BuildManifest:
             upstream_db,
             romfs_dir / "roms.ini",
             save_type_override=save_type,
-            game_name=game_name,
+            game_name=_ascii_title(options.app_name) if options.app_name else None,
         )
         warnings.extend(db_result.warnings)
         manifest.rom["rom_db"] = {
@@ -874,10 +892,28 @@ def build(options: BuildOptions) -> BuildManifest:
             ),
         )
 
+        display_title = _display_title(options, db_result.name, rom)
+        manifest.title["display_name"] = display_title
+        artwork = make_home_artwork(
+            title=display_title,
+            seed=rom.sha256,
+            font_path=font,
+            banner_template=banner,
+            out_dir=work / "art",
+            icon_image=options.icon_image.expanduser() if options.icon_image else None,
+            banner_image=options.banner_image.expanduser() if options.banner_image else None,
+        )
+        manifest.title["artwork"] = artwork.as_dict()
+        log_handle.write(
+            f"home menu title={display_title!r} icon={artwork.icon_source} banner={artwork.banner_source}\n"
+        )
+        icon = artwork.icon_png
+        banner = artwork.banner
+
         smdh = work / "app.smdh"
         _create_smdh(
             toolchain=toolchain,
-            game_name=game_name,
+            game_name=display_title,
             icon=icon,
             output=smdh,
             log_handle=log_handle,
@@ -971,6 +1007,13 @@ def build(options: BuildOptions) -> BuildManifest:
         manifest.aot = aot_info
 
         build_dir = work / "daedalus-build"
+        # With a reused --build-dir CMake relinks only when the code changed,
+        # and the 3DSX/CIA are POST_BUILD steps of that link: drop the old
+        # outputs and the ELF so a new icon, banner or RomFS always lands in
+        # the CIA.
+        for stale in (work / "DaedalusX64.cia", work / "DaedalusX64.3dsx", build_dir / "Source" / "daedalus.elf"):
+            if stale.is_file():
+                stale.unlink()
         if toolchain.kit_recipe is not None:
             _build_from_recipe(
                 toolchain=toolchain,

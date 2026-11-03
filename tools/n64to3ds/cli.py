@@ -100,7 +100,24 @@ def _build_parser() -> argparse.ArgumentParser:
     build_parser.add_argument(
         "--app-name",
         default=None,
-        help="HOME menu name (default: the ROM header name); with --title-id, lets two builds of one ROM coexist",
+        help=(
+            "HOME menu name (default: the name in the ROM database, else the ROM header name); "
+            "with --title-id, lets two builds of one ROM coexist"
+        ),
+    )
+    build_parser.add_argument(
+        "--icon",
+        type=Path,
+        default=None,
+        metavar="PNG",
+        help="HOME menu icon image (cropped to a square and scaled to 48x48; default: drawn with the game's name)",
+    )
+    build_parser.add_argument(
+        "--banner-image",
+        type=Path,
+        default=None,
+        metavar="PNG",
+        help="top-screen banner image (fitted into 256x128, transparency kept; default: drawn with the game's name)",
     )
     build_parser.add_argument(
         "--jobs", type=_positive_int, default=None, help="parallel build jobs (default: CPU count)"
@@ -211,6 +228,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
         build_dir=args.build_dir,
         title_id=args.title_id,
         app_name=args.app_name,
+        icon_image=args.icon,
+        banner_image=args.banner_image,
         jobs=args.jobs or BuildOptions.__dataclass_fields__["jobs"].default,
         rom_db=args.rom_db,
         save_type=args.save_type,
