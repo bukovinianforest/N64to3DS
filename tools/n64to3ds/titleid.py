@@ -9,7 +9,6 @@ machines but deterministic for repeated builds on one machine.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -17,7 +16,13 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; lock the registry with msvcrt there.
+    fcntl = None
+    import msvcrt
 
 from .errors import RomError
 
@@ -108,6 +113,24 @@ def registry_path() -> Path:
     return Path.home() / ".local" / "share" / "n64to3ds" / "titles.json"
 
 
+def _lock_registry(handle: IO[str]) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return
+    # msvcrt locks bytes from the current position.  LK_LOCK retries for about
+    # 10 seconds and then raises OSError, which falls back to no registry.
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+
+
+def _unlock_registry(handle: IO[str]) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def _load_registry(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"version": 1, "titles": {}}
@@ -163,10 +186,12 @@ def choose_title_id(
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             lock_handle = open(path.with_suffix(".lock"), "a+")
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            _lock_registry(lock_handle)
             registry = _load_registry(path)
         except OSError as exc:
             warnings.append(f"Title-id registry unavailable ({exc}); using the ROM-derived id without cross-build checking.")
+            if lock_handle is not None:
+                lock_handle.close()
             use_registry = False
             registry = {"version": 1, "titles": {}}
 
@@ -220,5 +245,5 @@ def choose_title_id(
             try:
                 _write_registry(path, registry)
             finally:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                _unlock_registry(lock_handle)
                 lock_handle.close()
